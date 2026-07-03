@@ -1,10 +1,13 @@
 import { Response } from "express";
 import { JwtPayload, SignOptions } from "jsonwebtoken";
+import crypto from "crypto";
 import { jwtUtils } from "./jwt";
 import { envConfig } from "../config/env";
 import { CookieUtils } from "./cookie";
 
-
+const hashToken = (token: string): string => {
+    return crypto.createHash("sha256").update(token).digest("hex");
+};
 
 const getAccessToken = (payload: JwtPayload) => {
     return jwtUtils.createToken(
@@ -53,6 +56,7 @@ const setBetterAuthSessionCookie = (res: Response, token: string) => {
 }
 
 export const tokenUtils = {
+    hashToken,
     getAccessToken,
     getRefreshToken,
     setAccessTokenCookie,

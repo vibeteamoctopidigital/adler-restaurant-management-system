@@ -1,13 +1,9 @@
-import { toNodeHandler } from "better-auth/node";
 import express, { type Express } from "express";
 import { envConfig } from "./config/env";
 import { applyMiddleware } from "./middleware";
 import { errorHandler } from "./middleware/errorHandler";
 import { notFound } from "./middleware/notFound";
 import indexRouter from "./routes/index.route";
-import path from "path";
-import axios from "axios";
-import { cwd } from "process";
 const app: Express = express();
 
 

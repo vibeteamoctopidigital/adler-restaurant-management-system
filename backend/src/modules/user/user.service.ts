@@ -6,83 +6,92 @@ import { envConfig } from "../../config/env";
 import { AppError } from "../../utils/AppError";
 
 // ─── Login ───────────────────────────────────────────────────────
-const loginAdmin = async (email: string, password: string) => {
-  // 1. Find admin by email
-  const admin = await prisma.admin.findUnique({ where: { email } });
-  if (!admin) {
+const loginUser = async (email: string, password: string) => {
+  // 1. Find user by email
+  const user = await prisma.user.findUnique({ where: { email } });
+  if (!user) {
     throw new AppError("Invalid email or password.", 401);
   }
 
-  // 2. Check if admin is active
-  if (!admin.isActive) {
-    throw new AppError("This admin account has been deactivated.", 403);
+  // 2. Check if user is active
+  if (!user.isActive) {
+    throw new AppError("Your account has been deactivated. Please contact admin.", 403);
   }
 
   // 3. Verify password
-  const isPasswordValid = await verifyPassword(password, admin.passwordHash);
+  const isPasswordValid = await verifyPassword(password, user.passwordHash);
   if (!isPasswordValid) {
     throw new AppError("Invalid email or password.", 401);
   }
 
   // 4. Generate tokens
-  const payload = { userId: admin.id, email: admin.email, role: "ADMIN" as const };
+  const payload = { userId: user.id, email: user.email, role: "USER" as const };
   const accessToken = tokenUtils.getAccessToken(payload);
   const refreshToken = tokenUtils.getRefreshToken(payload);
 
   // 5. Store refresh token hash in DB
   const refreshTokenHash = tokenUtils.hashToken(refreshToken);
-  await prisma.adminRefreshToken.create({
+  await prisma.userRefreshToken.create({
     data: {
-      adminId: admin.id,
+      userId: user.id,
       tokenHash: refreshTokenHash,
       expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 days
     },
   });
 
   // 6. Update lastLoginAt
-  await prisma.admin.update({
-    where: { id: admin.id },
+  await prisma.user.update({
+    where: { id: user.id },
     data: { lastLoginAt: new Date() },
   });
 
   return {
     accessToken,
     refreshToken,
-    admin: {
-      id: admin.id,
-      email: admin.email,
-      firstName: admin.firstName,
-      lastName: admin.lastName,
+    user: {
+      id: user.id,
+      email: user.email,
+      firstName: user.firstName,
+      lastName: user.lastName,
+      mustChangePassword: user.mustChangePassword,
     },
   };
 };
 
 // ─── Profile ─────────────────────────────────────────────────────
-const getAdminProfile = async (adminId: string) => {
-  const admin = await prisma.admin.findUnique({
-    where: { id: adminId },
+const getUserProfile = async (userId: string) => {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
     select: {
       id: true,
       email: true,
       firstName: true,
       lastName: true,
+      phone: true,
+      contractType: true,
+      workloadPercent: true,
+      hourlyRate: true,
+      monthlySalary: true,
+      contractedHoursMonthly: true,
+      hireDate: true,
       isActive: true,
+      mustChangePassword: true,
       lastLoginAt: true,
       createdAt: true,
       updatedAt: true,
     },
   });
 
-  if (!admin) {
-    throw new AppError("Admin not found.", 404);
+  if (!user) {
+    throw new AppError("User not found.", 404);
   }
 
-  return admin;
+  return user;
 };
 
 // ─── Refresh Token ───────────────────────────────────────────────
-const refreshAdminToken = async (oldRefreshToken: string) => {
-  // 1. Decode the token to get admin ID (without verifying expiry first)
+const refreshUserToken = async (oldRefreshToken: string) => {
+  // 1. Verify the token
   const decoded = jwtUtils.verifyToken(oldRefreshToken, envConfig.REFRESH_TOKEN_SECRET);
 
   if (!decoded.success || !decoded.data) {
@@ -91,10 +100,10 @@ const refreshAdminToken = async (oldRefreshToken: string) => {
 
   const { userId } = decoded.data as { userId: string };
 
-  // 2. Find all non-revoked refresh tokens for this admin
-  const storedTokens = await prisma.adminRefreshToken.findMany({
+  // 2. Find all non-revoked refresh tokens for this user
+  const storedTokens = await prisma.userRefreshToken.findMany({
     where: {
-      adminId: userId,
+      userId,
       revokedAt: null,
       expiresAt: { gt: new Date() },
     },
@@ -115,27 +124,27 @@ const refreshAdminToken = async (oldRefreshToken: string) => {
   }
 
   // 4. Revoke the old token
-  await prisma.adminRefreshToken.update({
+  await prisma.userRefreshToken.update({
     where: { id: matchedToken.id },
     data: { revokedAt: new Date() },
   });
 
-  // 5. Get admin data for new token payload
-  const admin = await prisma.admin.findUnique({ where: { id: userId } });
-  if (!admin || !admin.isActive) {
-    throw new AppError("Admin account not found or deactivated.", 403);
+  // 5. Get user data for new token payload
+  const user = await prisma.user.findUnique({ where: { id: userId } });
+  if (!user || !user.isActive) {
+    throw new AppError("User account not found or deactivated.", 403);
   }
 
   // 6. Generate new token pair
-  const payload = { userId: admin.id, email: admin.email, role: "ADMIN" as const };
+  const payload = { userId: user.id, email: user.email, role: "USER" as const };
   const newAccessToken = tokenUtils.getAccessToken(payload);
   const newRefreshToken = tokenUtils.getRefreshToken(payload);
 
   // 7. Store new refresh token hash
   const newRefreshTokenHash = tokenUtils.hashToken(newRefreshToken);
-  await prisma.adminRefreshToken.create({
+  await prisma.userRefreshToken.create({
     data: {
-      adminId: admin.id,
+      userId: user.id,
       tokenHash: newRefreshTokenHash,
       expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
     },
@@ -145,8 +154,7 @@ const refreshAdminToken = async (oldRefreshToken: string) => {
 };
 
 // ─── Logout ──────────────────────────────────────────────────────
-const logoutAdmin = async (refreshToken: string) => {
-  // Decode to get admin ID
+const logoutUser = async (refreshToken: string) => {
   const decoded = jwtUtils.decodeToken(refreshToken);
   if (!decoded?.userId) {
     throw new AppError("Invalid refresh token.", 401);
@@ -155,9 +163,9 @@ const logoutAdmin = async (refreshToken: string) => {
   const { userId } = decoded as { userId: string };
 
   // Find and revoke the matching token
-  const storedTokens = await prisma.adminRefreshToken.findMany({
+  const storedTokens = await prisma.userRefreshToken.findMany({
     where: {
-      adminId: userId,
+      userId,
       revokedAt: null,
     },
   });
@@ -165,7 +173,7 @@ const logoutAdmin = async (refreshToken: string) => {
   const targetHash = tokenUtils.hashToken(refreshToken);
   for (const stored of storedTokens) {
     if (targetHash === stored.tokenHash) {
-      await prisma.adminRefreshToken.update({
+      await prisma.userRefreshToken.update({
         where: { id: stored.id },
         data: { revokedAt: new Date() },
       });
@@ -174,9 +182,9 @@ const logoutAdmin = async (refreshToken: string) => {
   }
 };
 
-export const adminServices = {
-  loginAdmin,
-  getAdminProfile,
-  refreshAdminToken,
-  logoutAdmin,
+export const userServices = {
+  loginUser,
+  getUserProfile,
+  refreshUserToken,
+  logoutUser,
 };

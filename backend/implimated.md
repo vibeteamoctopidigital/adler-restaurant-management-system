@@ -40,3 +40,75 @@ Here is a summary of all the tasks and architectural changes that have been succ
 ## 5. Database Syncing
 - **Client Generation:** Successfully ran `npx prisma generate` inside the backend directory to compile the multi-file structure into your `src/generated/prisma` client.
 - **Database Migration:** Pushed the new schema forcefully using `npx prisma db push --accept-data-loss` (safely handling the dropped `employee_profiles` table), successfully synchronizing the remote Neon PostgreSQL database. The database is now 100% in sync with the codebase.
+
+## 6. Manual Admin & User Login System
+
+A complete manual authentication and user management system was implemented with **15 API endpoints** across 3 route groups. No third-party auth library (like `better-auth`) is used — everything is hand-rolled using JWT, bcrypt, and Prisma.
+
+### Auth Middleware (`src/middleware/auth.ts`)
+- **`authenticate`** — Reads `accessToken` from HttpOnly cookies, verifies the JWT, and attaches `{ userId, email, role }` to `res.locals.auth`. Rejects with 401 if missing or expired.
+- **`authorizeAdmin`** — Must be used after `authenticate`. Checks `res.locals.auth.role === "ADMIN"` and rejects with 403 otherwise.
+
+### Admin Auth Module (`/api/v1/auth/admin`)
+| File | Purpose |
+|------|---------|
+| `admin.validation.ts` | Zod schema for admin login (email + password) |
+| `admin.service.ts` | `loginAdmin`, `getAdminProfile`, `refreshAdminToken`, `logoutAdmin` — full token lifecycle with DB-backed refresh token storage and rotation |
+| `admin.controller.ts` | HTTP controllers that call the service and set/clear cookies |
+| `admin.route.ts` | `POST /login` (public), `POST /refresh` (public), `POST /logout` (auth), `GET /profile` (admin) |
+
+### User Auth Module (`/api/v1/auth/user`)
+| File | Purpose |
+|------|---------|
+| `user.validation.ts` | Zod schema for user login |
+| `user.service.ts` | `loginUser`, `getUserProfile`, `refreshUserToken`, `logoutUser` — mirrors admin service with `User` and `UserRefreshToken` models |
+| `user.controller.ts` | HTTP controllers |
+| `user.route.ts` | `POST /login` (public), `POST /refresh` (public), `POST /logout` (auth), `GET /profile` (auth) |
+
+### Admin User Management Module (`/api/v1/admin/users`)
+| File | Purpose |
+|------|---------|
+| `user-management.validation.ts` | Zod schemas for create, update, userId param, and list query (pagination + filters) |
+| `user-management.service.ts` | `createUser`, `updateUser`, `deleteUser`, `deactivateUser`, `activateUser`, `getAllUsers`, `getUserById` — full CRUD with email uniqueness, bcrypt hashing, paginated listing, search, and soft deactivation |
+| `user-management.controller.ts` | HTTP controllers |
+| `user-management.route.ts` | 7 endpoints — all guarded by `authenticate` + `authorizeAdmin` at the router level |
+
+### Seed Script (`src/scripts/seed.ts`)
+- Idempotent script that creates a default admin (`admin@adler.com` / `Admin@123456`) only if none exists.
+- Run with: `npx tsx src/scripts/seed.ts`
+
+### Route Wiring (`src/routes/index.route.ts`)
+- Mounted `adminAuthRouter` at `/auth/admin`
+- Mounted `userAuthRouter` at `/auth/user`
+- Mounted `userManagementRouter` at `/admin/users`
+
+### Security Measures
+- Passwords hashed with bcrypt (12 rounds)
+- JWT access tokens (15 min) in HttpOnly Secure SameSite=None cookies
+- JWT refresh tokens (7 days) in HttpOnly Secure cookies with hash stored in DB
+- Refresh token rotation — old token revoked on every refresh
+- Deactivating a user immediately revokes all their active refresh tokens
+- No password hashes ever returned in API responses
+- Zod validation on all inputs
+- Cleaned unused `better-auth` imports from `app.ts`
+
+### API Documentation
+- Full documentation written in `API_Doc.md` with request/response examples, field validation rules, error codes, and seed script instructions.
+
+## 7. Strict TypeScript Compatibility Fixes
+
+Fixed all 5 TypeScript errors caused by `exactOptionalPropertyTypes: true` and `noUncheckedIndexedAccess: true` in `tsconfig.json`:
+
+### `user-management.controller.ts`
+- **`req.params.userId`** returns `string | string[] | undefined` under strict mode. Fixed by using explicit cast: `req.params.userId as string` (safe because Express route params with `:userId` are always strings).
+- **`getAllUsers` query type** — Zod's inferred type includes `| undefined` for optional fields, but the service function's exact optional property types reject this. Fixed by constructing the query object imperatively, only assigning `isActive` and `search` when they are defined.
+
+### `user-management.service.ts`
+- **`createUser` Prisma data** — Prisma with `exactOptionalPropertyTypes` rejects `undefined` for nullable fields (it expects `string | null`, not `string | undefined`). Fixed by building the `Prisma.UserCreateInput` object imperatively, only assigning optional fields when they are actually provided, so `undefined` is never passed to Prisma.
+
+## 8. Security Enhancement: JWT Token Hashing Fix
+
+Discovered and fixed a massive vulnerability regarding how `Refresh Tokens` were hashed in the database.
+- **The Issue:** `bcrypt` silently truncates inputs to a maximum length of 72 bytes. Because JWT strings easily exceed 150 characters, and the first 72 characters of a JWT represent the Base64-encoded Header and the initial part of the Payload (which is identical for the same user across multiple tokens), `bcrypt` would compute the **exact same hash** for every single refresh token generated for a given user. This would cause token collision on logout or refresh.
+- **The Fix:** Swapped `bcrypt` for `crypto.createHash('sha256')` in `src/utils/token.ts` for hashing JSON Web Tokens, which handles arbitrary string lengths securely and deterministically without truncation. Password hashes still securely use `bcrypt`.
+

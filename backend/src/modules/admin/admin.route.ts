@@ -1,0 +1,18 @@
+import { Router } from "express";
+import { asyncHandler } from "../../utils/asyncHandler";
+import { validateRequest } from "../../middleware/validateRequest";
+import { authenticate, authorizeAdmin } from "../../middleware/auth";
+import { adminLoginSchema } from "./admin.validation";
+import * as adminController from "./admin.controller";
+
+const adminAuthRouter = Router();
+
+// Public routes
+adminAuthRouter.post("/login", validateRequest(adminLoginSchema), asyncHandler(adminController.login));
+adminAuthRouter.post("/refresh", asyncHandler(adminController.refreshToken));
+
+// Protected routes
+adminAuthRouter.post("/logout", authenticate, asyncHandler(adminController.logout));
+adminAuthRouter.get("/profile", authenticate, authorizeAdmin, asyncHandler(adminController.getProfile));
+
+export default adminAuthRouter;

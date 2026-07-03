@@ -1,0 +1,48 @@
+enum NotificationType {
+  WEEKLY_SHIFTS_PUBLISHED
+  AVAILABILITY_REMINDER
+  SWAP_REQUEST_RECEIVED
+  SWAP_REQUEST_RESULT
+  SHIFT_CHANGED
+  RULE_VIOLATION
+  GENERAL
+}
+
+enum NotificationChannel {
+  PUSH
+  EMAIL
+  IN_APP
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  FAILED
+  READ
+}
+
+model Notification {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  type    NotificationType
+  channel NotificationChannel
+  status  NotificationStatus  @default(PENDING)
+
+  title   String
+  body    String
+  payload Json?
+
+  sentAt     DateTime?
+  readAt     DateTime?
+  failReason String?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, status])
+  @@index([userId, readAt])
+  @@index([type])
+  @@index([createdAt])
+  @@map("notifications")
+}

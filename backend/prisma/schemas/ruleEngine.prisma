@@ -1,0 +1,34 @@
+model OrgSettings {
+  id Int @id @default(1)
+
+  maxDailyHours             Decimal @db.Decimal(4, 2)
+  maxWeeklyHours            Decimal @db.Decimal(4, 2)
+  minRestHoursBetweenShifts Decimal @db.Decimal(4, 2)
+  minBreakMinutes           Int
+  breakRules                Json?
+
+  sessionTimeoutMinutes Int   @default(30)
+  notificationPrefs     Json?
+
+  swapExpiryHours Int @default(72)
+
+  updatedAt   DateTime @updatedAt
+  updatedById String?
+
+  @@map("org_settings")
+}
+
+model RuleCheckLog {
+  id          String   @id @default(cuid())
+  context     String
+  entityId    String
+  passed      Boolean
+  details     Json
+  checkedAt   DateTime @default(now())
+  checkedById String?
+  checkedBy   User?    @relation("RuleCheckActor", fields: [checkedById], references: [id])
+
+  @@index([context, entityId])
+  @@index([checkedAt])
+  @@map("rule_check_logs")
+}

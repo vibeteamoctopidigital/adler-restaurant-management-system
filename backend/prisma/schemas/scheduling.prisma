@@ -1,17 +1,3 @@
-enum PlanStatus {
-  DRAFT
-  SUBMITTED
-  PUBLISHED
-}
-
-enum ShiftStatus {
-  PENDING
-  ACCEPTED
-  REJECTED
-  CANCELLED
-  SWAPPED_OUT
-}
-
 model WeeklyPlan {
   id            String   @id @default(cuid())
   year          Int
@@ -23,7 +9,7 @@ model WeeklyPlan {
   status        PlanStatus @default(DRAFT)
   submittedAt   DateTime?
   submittedById String?
-  submittedBy   User?      @relation("PlanSubmittedBy", fields: [submittedById], references: [id])
+  submittedBy   Admin?     @relation("PlanSubmittedBy", fields: [submittedById], references: [id])
 
   needsRenotify Boolean @default(false)
 

@@ -1,17 +1,3 @@
-enum SwapType {
-  TARGETED
-  OPEN
-}
-
-enum SwapStatus {
-  PENDING_RECIPIENT
-  PENDING_ADMIN_APPROVAL
-  APPROVED
-  REJECTED
-  EXPIRED
-  CANCELLED
-}
-
 model SwapRequest {
   id String @id @default(cuid())
 
@@ -34,11 +20,11 @@ model SwapRequest {
   ruleCheckPassed Boolean?
   ruleCheckedAt   DateTime?
 
-  adminId     String?
-  admin       User?     @relation("SwapAdmin", fields: [adminId], references: [id])
-  adminReason String?
-  resolvedAt  DateTime?
-  expiresAt   DateTime?
+  approvedById String?
+  approvedBy   Admin?    @relation("SwapAdmin", fields: [approvedById], references: [id])
+  adminReason  String?
+  resolvedAt   DateTime?
+  expiresAt    DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

@@ -26,7 +26,7 @@ model RuleCheckLog {
   details     Json
   checkedAt   DateTime @default(now())
   checkedById String?
-  checkedBy   User?    @relation("RuleCheckActor", fields: [checkedById], references: [id])
+  checkedBy   Admin?   @relation("RuleCheckActor", fields: [checkedById], references: [id])
 
   @@index([context, entityId])
   @@index([checkedAt])

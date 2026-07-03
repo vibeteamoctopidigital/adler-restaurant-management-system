@@ -1,15 +1,3 @@
-enum AvailabilityMonthStatus {
-  DRAFT
-  SUBMITTED
-  LOCKED
-}
-
-enum DayAvailabilityStatus {
-  AVAILABLE
-  UNAVAILABLE
-  WISH
-}
-
 model AvailabilityMonth {
   id     String @id @default(cuid())
   userId String

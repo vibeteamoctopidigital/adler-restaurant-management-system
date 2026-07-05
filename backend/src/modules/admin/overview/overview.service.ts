@@ -68,6 +68,38 @@ const getOverview = async () => {
       hoursDue: thisMonth.summary.hoursDue,
       wageCost: thisMonth.summary.wageCost,
     },
+    availability: await getAvailabilitySummary(),
+  };
+};
+
+// Availability submission progress for the most recently opened month.
+const getAvailabilitySummary = async () => {
+  const latest = await prisma.availabilityMonth.findFirst({
+    orderBy: [{ year: "desc" }, { month: "desc" }],
+    select: { year: true, month: true },
+  });
+  if (!latest) return null;
+
+  const [total, submitted, pendingRows] = await Promise.all([
+    prisma.availabilityMonth.count({ where: { year: latest.year, month: latest.month } }),
+    prisma.availabilityMonth.count({
+      where: { year: latest.year, month: latest.month, status: "SUBMITTED" },
+    }),
+    prisma.availabilityMonth.findMany({
+      where: { year: latest.year, month: latest.month, status: { not: "SUBMITTED" } },
+      take: 20,
+      select: {
+        user: { select: { id: true, name: true, firstName: true, lastName: true, email: true } },
+      },
+    }),
+  ]);
+
+  return {
+    year: latest.year,
+    month: latest.month,
+    submitted,
+    total,
+    notSubmitted: pendingRows.map((r) => r.user),
   };
 };
 

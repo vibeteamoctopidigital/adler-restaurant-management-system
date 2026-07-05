@@ -4,7 +4,7 @@
 
 **Health check:** `GET http://localhost:8000/health` → `{ "status": "ok", "uptime": <sec>, "timestamp": "..." }`
 
-**Status:** All 50 endpoints below are implemented and verified end-to-end (automated smoke test, all passing).
+**Status:** All 57 endpoints below are implemented and verified end-to-end (automated smoke test, all passing).
 
 **Example request (cURL):** cookie-based auth — log in once to a cookie jar, then reuse it.
 ```bash
@@ -39,7 +39,7 @@ JWT tokens are issued as **HttpOnly cookies** on login — the client never hand
 |-------|-----------|------------|
 | `authenticate` | any protected route | `401` if no/invalid `accessToken` |
 | `authorizeAdmin` | all `/admin/**` routes | `403` if the caller is not an admin |
-| `authorizeUser` | staff routes (`/shifts`, `/notifications`, `/swaps`) | `403` if the caller is not a staff user |
+| `authorizeUser` | staff routes (`/shifts`, `/notifications`, `/swaps`, `/availability`) | `403` if the caller is not a staff user |
 
 ### Success response envelope
 ```json
@@ -107,12 +107,14 @@ src/
 │   │   ├── shifts/                 # shift offers, notify, approvals
 │   │   ├── swaps/                  # swap review (approve / reject)
 │   │   ├── reports/                # hours & wage reports + CSV
-│   │   └── settings/               # org L-GAV rules + notification prefs
+│   │   ├── settings/               # org L-GAV rules + notification prefs
+│   │   └── availability/           # open month, status, nudge
 │   └── user/                       # staff (mobile) features
 │       ├── auth/                   # login, refresh, logout, profile
 │       ├── shifts/                 # view + accept / decline shifts
 │       ├── notifications/          # list + mark read
-│       └── swaps/                  # request / list / cancel swaps
+│       ├── swaps/                  # request / list / cancel swaps
+│       └── availability/           # get / save days / submit
 ├── middleware/  (auth, validateRequest, errorHandler, notFound)
 ├── routes/index.route.ts           # mounts every feature router
 ├── config/  ·  utils/  ·  generated/prisma/
@@ -133,11 +135,13 @@ Each file's role: **`*.route.ts`** wires paths + guards + validation → **`*.co
 8. [Admin — Shift Swaps](#8-admin--shift-swaps)
 9. [Admin — Reports](#9-admin--reports)
 10. [Admin — Settings](#10-admin--settings)
-11. [Staff — Shifts](#11-staff--shifts)
-12. [Staff — Notifications](#12-staff--notifications)
-13. [Staff — Shift Swaps](#13-staff--shift-swaps)
-14. [Enum Reference](#14-enum-reference)
-15. [Seed Script](#15-seed-script)
+11. [Admin — Availability](#11-admin--availability)
+12. [Staff — Shifts](#12-staff--shifts)
+13. [Staff — Notifications](#13-staff--notifications)
+14. [Staff — Shift Swaps](#14-staff--shift-swaps)
+15. [Staff — Availability](#15-staff--availability)
+16. [Enum Reference](#16-enum-reference)
+17. [Seed Script](#17-seed-script)
 
 ---
 
@@ -230,12 +234,17 @@ Dashboard stat tiles.
     "shifts": { "draft": 2, "upcoming": 5, "awaitingApproval": 1 },
     "approvals": { "pendingResponses": 3 },
     "swaps": { "pending": 3 },
-    "thisMonth": { "period": { "year": 2026, "month": 7 }, "scheduledHours": 1842, "overtime": 46, "hoursDue": 24, "wageCost": 39260 }
+    "thisMonth": { "period": { "year": 2026, "month": 7 }, "scheduledHours": 1842, "overtime": 46, "hoursDue": 24, "wageCost": 39260 },
+    "availability": {
+      "year": 2026, "month": 12, "submitted": 9, "total": 12,
+      "notSubmitted": [ { "id": "…", "name": "Marco Bianchi", "email": "marco@adler.ch" } ]
+    }
   }
 }
 ```
 - `shifts.draft` = shifts not yet notified · `upcoming` = notified & not ended · `awaitingApproval` = notified shifts with ≥1 pending acceptance.
 - `thisMonth` is computed from admin-approved shifts in the current month (same engine as Reports).
+- `availability` summarizes the **most recently opened** availability month (`null` if none opened): `submitted` / `total` and up to 20 employees who haven't submitted (the Overview "Not submitted yet · Nudge" list).
 
 ---
 
@@ -546,7 +555,45 @@ Body — any subset (at least one field, else `400`):
 
 ---
 
-## 11. Staff — Shifts
+## 11. Admin — Availability
+Base path `/admin/availability`. The admin **opens** a month for availability collection, watches who has submitted, views individual submissions, and nudges stragglers. (Staff fill and submit from the mobile app — §14.)
+
+### `POST http://localhost:8000/api/v1/admin/availability/open`  · open a month
+Creates an availability slot for **every active employee** for the month (existing slots keep what's filled and just get the new cut-off).
+```json
+{ "year": 2026, "month": 12, "cutoffAt": "2026-12-20T00:00:00.000Z" }
+```
+| Field | Rules |
+|-------|-------|
+| `year` | int 2000–2100 |
+| `month` | int 1–12 |
+| `cutoffAt` | ISO 8601 date-time — the binding submission deadline |
+
+`201` → `{ "data": { "year": 2026, "month": 12, "cutoffAt": "…", "opened": 12 } }`. `409` if there are no active employees.
+
+### `GET http://localhost:8000/api/v1/admin/availability?year=2026&month=12`  · submission status
+```json
+{ "success": true, "data": {
+    "year": 2026, "month": 12,
+    "employees": [
+      { "userId": "…", "name": "Anna Müller", "firstName": null, "lastName": null, "email": "…",
+        "status": "SUBMITTED", "submittedAt": "…", "cutoffAt": "…", "filledDays": 12 },
+      { "userId": "…", "name": "Luca Rossi", "status": "DRAFT", "submittedAt": null, "cutoffAt": "…", "filledDays": 0 }
+    ],
+    "notSubmitted": [ { "userId": "…", "name": "Luca Rossi", "status": "DRAFT", … } ],
+    "summary": { "total": 12, "submitted": 9, "notSubmitted": 3 } } }
+```
+`status` is `SUBMITTED` \| `DRAFT` \| `LOCKED` \| `NOT_OPENED` (the last means the employee has no slot for that month, e.g. hired after it was opened).
+
+### `GET http://localhost:8000/api/v1/admin/availability/:userId?year=2026&month=12`  · one employee's submission
+Returns that employee's month with the full `days[]` (each: `date`, `status`, `note`, `preferredStartTime`, `preferredEndTime`) plus the `user`. `404` if they have no slot for the month.
+
+### `POST http://localhost:8000/api/v1/admin/availability/:userId/nudge`  · one-tap reminder
+Body: `{ "year": 2026, "month": 12 }`. Sends the employee an `AVAILABILITY_REMINDER` notification. `409` if their month isn't open or they've **already submitted**.
+
+---
+
+## 12. Staff — Shifts
 Base path `/shifts`. Staff-guarded (mobile app). Only **published** shifts (notified) are ever visible here.
 
 ### `GET http://localhost:8000/api/v1/shifts`  · available shifts
@@ -570,7 +617,7 @@ Errors: `400` bad enum · `404` shift not published · `409` shift already ended
 
 ---
 
-## 12. Staff — Notifications
+## 13. Staff — Notifications
 Base path `/notifications`. Staff-guarded. Scoped to the caller.
 
 ### `GET http://localhost:8000/api/v1/notifications`
@@ -591,7 +638,7 @@ Notification `type` values you'll see: `SHIFT_OFFER_PUBLISHED` (new shift), `SHI
 
 ---
 
-## 13. Staff — Shift Swaps
+## 14. Staff — Shift Swaps
 Base path `/swaps`. Staff-guarded (mobile app). Employees request to swap their **confirmed** shifts.
 
 ### `POST http://localhost:8000/api/v1/swaps`  · request a swap
@@ -611,7 +658,46 @@ Query: `page`, `limit`, `status`, `role` (`initiated` \| `received`). Returns sw
 
 ---
 
-## 14. Enum Reference
+## 15. Staff — Availability
+Base path `/availability`. Staff-guarded (mobile app). Employees record their availability & wishes for a month the admin has opened, then submit bindingly before the cut-off.
+
+### `GET http://localhost:8000/api/v1/availability/:year/:month`  · my availability
+```json
+{ "success": true, "data": { "availability": {
+    "id": "…", "year": 2026, "month": 12, "status": "DRAFT", "cutoffAt": "…", "submittedAt": null,
+    "days": [
+      { "id": "…", "date": "2026-12-05", "status": "WISH", "note": "prefer morning",
+        "preferredStartTime": "2026-12-05T08:00:00.000Z", "preferredEndTime": "2026-12-05T14:00:00.000Z" }
+    ] } } }
+```
+`404` if the admin hasn't opened this month yet.
+
+### `PUT http://localhost:8000/api/v1/availability/:year/:month/days`  · save my day entries
+**Full replace** of my entries for the month.
+```json
+{ "days": [
+  { "date": "2026-12-01", "status": "AVAILABLE" },
+  { "date": "2026-12-05", "status": "WISH", "note": "prefer morning",
+    "preferredStartTime": "2026-12-05T08:00:00.000Z", "preferredEndTime": "2026-12-05T14:00:00.000Z" },
+  { "date": "2026-12-24", "status": "UNAVAILABLE", "note": "holiday" }
+] }
+```
+| Field (per day) | Rules |
+|-----------------|-------|
+| `date` | valid date **within** the target month (`400` otherwise); no duplicates in the payload |
+| `status` | `AVAILABLE` \| `UNAVAILABLE` \| `WISH` |
+| `note` | ≤ 500 chars, optional |
+| `preferredStartTime` / `preferredEndTime` | ISO date-time, optional |
+
+`200` → the updated availability. Editable only while `status = DRAFT` **and** before `cutoffAt` — otherwise `409` (`404` if not open).
+
+### `POST http://localhost:8000/api/v1/availability/:year/:month/submit`  · submit bindingly
+Moves `DRAFT → SUBMITTED` and stamps `submittedAt`. After this the month is read-only.
+`200` → the submitted availability. Errors: `400` no days added · `409` already submitted / cut-off passed · `404` not open.
+
+---
+
+## 16. Enum Reference
 
 | Enum | Values |
 |------|--------|
@@ -627,7 +713,7 @@ Query: `page`, `limit`, `status`, `role` (`initiated` \| `received`). Returns sw
 
 ---
 
-## 15. Seed Script
+## 17. Seed Script
 
 Create the default admin (idempotent):
 ```bash
@@ -651,9 +737,11 @@ Credentials: **`admin@adler.com`** / **`Admin@123456`** (change after first logi
 | Admin — Shift Swaps | 3 |
 | Admin — Reports | 2 |
 | Admin — Settings | 2 |
+| Admin — Availability | 4 |
 | Staff — Shifts | 3 |
 | Staff — Notifications | 3 |
 | Staff — Shift Swaps | 3 |
-| **Total** | **50** |
+| Staff — Availability | 3 |
+| **Total** | **57** |
 
-> **Not yet implemented (deferred scheduling engine):** weekly-plan generation ("Manage Plans"), employee availability submission, and the legacy `WeeklyPlan`-based swap/rule engine. These depend on the availability + weekly-plan models and mobile-side submission, and are documented in `implimated.md` §10–11.
+> **Not yet implemented (deferred scheduling engine):** the weekly-plan auto-generation ("Manage Plans") — turning demand + submitted availability into a rule-compliant proposed roster, with hand-adjustment and per-change L-GAV feedback. Employee **availability collection is now implemented** (§11 & §15); what remains is the constraint-solving/roster-generation layer on top of it, plus the legacy `WeeklyPlan`-based models. Also open (not blocking): "open to the whole team" swaps (current swaps are targeted) and actual clock-in/out worked-hours capture (reports currently derive hours from approved shifts). Tracked in `implimated.md`.

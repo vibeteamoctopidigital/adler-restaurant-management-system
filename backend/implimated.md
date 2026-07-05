@@ -339,3 +339,34 @@ Feature folders created:
 
 ### Endpoint count: unchanged — **50 endpoints**, all working.
 
+## 14. Full Audit, Re-verification & New **Availability** Feature
+
+Senior-engineer pass over the whole codebase + all prompts + the original briefing: regression-tested everything, then closed the clearest remaining gap — **employee availability collection** (briefing outcomes 1 & 2, and the Overview "Availability submitted / Not submitted yet · Nudge" tiles).
+
+### Regression (nothing regressed after the restructure)
+Re-ran the full automated sweep of the existing 50 endpoints: **90/92 assertions pass**; the 2 non-passing lines are the known intentional test-expectation quirks (short-password login → `400` before `401`; duplicate-email create → `409` before the `400` category check), both correct behaviour.
+
+### New: Availability (uses the pre-existing `AvailabilityMonth` / `AvailabilityDay` models — no schema change)
+The admin **opens** a month with a cut-off; each active employee gets a slot; staff fill days (AVAILABLE / UNAVAILABLE / WISH, with optional note + preferred times) and **submit bindingly** before the cut-off; the admin watches submission status and nudges stragglers.
+
+**Admin module** (`src/modules/admin/availability/`, `/api/v1/admin/availability`):
+- `POST /open` — `{ year, month, cutoffAt }` upserts a slot for every active employee (new → `DRAFT`, existing → keeps filled days, updates cut-off).
+- `GET /?year=&month=` — per-employee status (`SUBMITTED`/`DRAFT`/`LOCKED`/`NOT_OPENED`), `filledDays`, a `notSubmitted` list, and a `summary`.
+- `GET /:userId?year=&month=` — one employee's month with full `days[]`.
+- `POST /:userId/nudge` — `{ year, month }` sends an `AVAILABILITY_REMINDER` notification; `409` if not open or already submitted.
+
+**Staff module** (`src/modules/user/availability/`, `/api/v1/availability`):
+- `GET /:year/:month` — my slot + days (`404` if not opened).
+- `PUT /:year/:month/days` — full-replace my entries; validates each date is **within the month**, rejects duplicate dates, and only while `DRAFT` + before cut-off.
+- `POST /:year/:month/submit` — `DRAFT → SUBMITTED` (+`submittedAt`); read-only afterwards.
+
+**Overview integration:** added an `availability` block for the most-recently-opened month — `{ year, month, submitted, total, notSubmitted[] }` — powering the dashboard availability tile + nudge list (`null` when no month is open).
+
+### Verification (all green)
+`tsc --noEmit` → 0 errors. Full E2E of the availability flow, all confirmed: open Dec 2026 (2 slots) → status shows both `DRAFT` → staff GET own draft → **unopened month → 404** → save mixed days (AVAILABLE/WISH+note+times/UNAVAILABLE) → **date-outside-month → 400** → submit → status flips to `SUBMITTED` with `submittedAt` → **edit-after-submit → 409** → admin status now `submitted:1, notSubmitted:[Luca]` → admin views a user's days → **nudge Luca → notification received**; **nudge already-submitted Anna → 409** → **Overview** availability tile shows `1/2` + `[Luca]` → **cut-off passed → 409** → **admin hitting a staff route → 403** → **submit with no days → 400**. Test data cleaned up; DB left empty.
+
+### Still deferred (documented, not silently dropped)
+The **weekly-plan auto-scheduling engine** ("Manage Plans" — turn demand + the now-collected availability into a rule-compliant proposed roster, with hand-adjustment + per-change L-GAV feedback) remains the one large piece; it needs a constraint/roster-generation layer and the legacy `WeeklyPlan` models. Also open but non-blocking: "open to the whole team" swaps (today's swaps are targeted) and real clock-in/out worked-hours capture (reports derive hours from approved shifts). These are the recommended next builds.
+
+### Endpoint count: **57** (added 4 admin + 3 staff availability), all working.
+

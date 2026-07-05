@@ -9,12 +9,14 @@ import adminShiftRouter from "../modules/admin/shifts/shifts.route";
 import reportRouter from "../modules/admin/reports/reports.route";
 import settingsRouter from "../modules/admin/settings/settings.route";
 import adminSwapRouter from "../modules/admin/swaps/swaps.route";
+import adminAvailabilityRouter from "../modules/admin/availability/availability.route";
 
 // ── Staff (user) feature routers ───────────────────────────────────
 import userAuthRouter from "../modules/user/auth/auth.route";
 import userShiftRouter from "../modules/user/shifts/shifts.route";
 import notificationRouter from "../modules/user/notifications/notifications.route";
 import userSwapRouter from "../modules/user/swaps/swaps.route";
+import userAvailabilityRouter from "../modules/user/availability/availability.route";
 
 const indexRouter = Router();
 
@@ -30,10 +32,12 @@ indexRouter.use("/admin/shifts", adminShiftRouter);
 indexRouter.use("/admin/reports", reportRouter);
 indexRouter.use("/admin/settings", settingsRouter);
 indexRouter.use("/admin/swaps", adminSwapRouter);
+indexRouter.use("/admin/availability", adminAvailabilityRouter);
 
 // ── Staff (mobile) ─────────────────────────────────────────────────
 indexRouter.use("/shifts", userShiftRouter);
 indexRouter.use("/notifications", notificationRouter);
 indexRouter.use("/swaps", userSwapRouter);
+indexRouter.use("/availability", userAvailabilityRouter);
 
 export default indexRouter;

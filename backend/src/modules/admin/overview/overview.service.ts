@@ -1,7 +1,24 @@
 import { prisma } from "../../../config/db";
 import { reportServices } from "../reports/reports.service";
+import { adminSwapServices } from "../swaps/swaps.service";
 
-// Dashboard "Overview" stat tiles for the admin webapp.
+const displayName = (u: {
+  name: string | null;
+  firstName: string | null;
+  lastName: string | null;
+  email: string;
+}) => u.name ?? ([u.firstName, u.lastName].filter(Boolean).join(" ") || u.email);
+
+const WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const dayName = (d: Date) => WEEKDAYS[d.getUTCDay()];
+
+// Service vs. dinner service split — a shift starting before 16:00 is "Lunch".
+const mealPeriod = (d: Date) => (d.getUTCHours() < 16 ? "Lunch" : "Dinner");
+
+// YYYY-MM-DD from a @db.Date value (stored at UTC midnight).
+const dateOnly = (d: Date) => d.toISOString().slice(0, 10);
+
+// Dashboard "Overview" payload for the admin webapp.
 const getOverview = async () => {
   const now = new Date();
 
@@ -16,6 +33,9 @@ const getOverview = async () => {
     shiftsAwaitingApproval,
     pendingSwaps,
     thisMonth,
+    plans,
+    recentStaff,
+    swapList,
   ] = await Promise.all([
     prisma.user.count({ where: { isActive: true } }),
     prisma.user.count({ where: { isActive: false } }),
@@ -38,28 +58,60 @@ const getOverview = async () => {
     prisma.shiftSwapRequest.count({ where: { status: "PENDING" } }),
     // Scheduled/worked hours, overtime and wage cost for the current month.
     reportServices.buildReport({}),
+    // Weekly plans (newest first) with their assignment counts.
+    prisma.weeklyPlan.findMany({
+      orderBy: [{ weekStartDate: "desc" }],
+      take: 6,
+      select: {
+        id: true,
+        weekNumber: true,
+        weekStartDate: true,
+        weekEndDate: true,
+        status: true,
+        _count: { select: { shifts: true } },
+      },
+    }),
+    // Newest team members.
+    prisma.user.findMany({
+      orderBy: { createdAt: "desc" },
+      take: 6,
+      select: {
+        id: true,
+        name: true,
+        firstName: true,
+        lastName: true,
+        email: true,
+        designation: true,
+        department: true,
+        isActive: true,
+      },
+    }),
+    // Pending swaps, already carrying an advisory rule-check result.
+    adminSwapServices.listSwaps({ page: 1, limit: 5, status: "PENDING" }),
   ]);
 
   return {
-    employees: {
-      active: activeEmployees,
-      inactive: inactiveEmployees,
-      total: activeEmployees + inactiveEmployees,
-    },
-    categories: {
-      total: topCategories,
-      subCategories,
-    },
-    shifts: {
-      draft: draftShifts,
-      upcoming: upcomingShifts,
-      awaitingApproval: shiftsAwaitingApproval,
-    },
-    approvals: {
-      pendingResponses: pendingApprovals,
-    },
-    swaps: {
-      pending: pendingSwaps,
+    kpis: {
+      employees: {
+        active: activeEmployees,
+        inactive: inactiveEmployees,
+        total: activeEmployees + inactiveEmployees,
+      },
+      categories: {
+        total: topCategories,
+        subCategories,
+      },
+      shifts: {
+        draft: draftShifts,
+        upcoming: upcomingShifts,
+        awaitingApproval: shiftsAwaitingApproval,
+      },
+      approvals: {
+        pendingResponses: pendingApprovals,
+      },
+      swaps: {
+        pending: pendingSwaps,
+      },
     },
     thisMonth: {
       period: thisMonth.period,
@@ -68,38 +120,31 @@ const getOverview = async () => {
       hoursDue: thisMonth.summary.hoursDue,
       wageCost: thisMonth.summary.wageCost,
     },
-    availability: await getAvailabilitySummary(),
-  };
-};
-
-// Availability submission progress for the most recently opened month.
-const getAvailabilitySummary = async () => {
-  const latest = await prisma.availabilityMonth.findFirst({
-    orderBy: [{ year: "desc" }, { month: "desc" }],
-    select: { year: true, month: true },
-  });
-  if (!latest) return null;
-
-  const [total, submitted, pendingRows] = await Promise.all([
-    prisma.availabilityMonth.count({ where: { year: latest.year, month: latest.month } }),
-    prisma.availabilityMonth.count({
-      where: { year: latest.year, month: latest.month, status: "SUBMITTED" },
-    }),
-    prisma.availabilityMonth.findMany({
-      where: { year: latest.year, month: latest.month, status: { not: "SUBMITTED" } },
-      take: 20,
-      select: {
-        user: { select: { id: true, name: true, firstName: true, lastName: true, email: true } },
-      },
-    }),
-  ]);
-
-  return {
-    year: latest.year,
-    month: latest.month,
-    submitted,
-    total,
-    notSubmitted: pendingRows.map((r) => r.user),
+    plans: plans.map((p) => ({
+      id: p.id,
+      weekNumber: p.weekNumber,
+      dateRange: { start: dateOnly(p.weekStartDate), end: dateOnly(p.weekEndDate) },
+      status: p.status.toLowerCase(),
+      assignmentsCount: p._count.shifts,
+    })),
+    swaps: swapList.swaps.map((s) => ({
+      id: s.id,
+      fromEmployeeId: s.initiatorUser.id,
+      toEmployeeId: s.recipientUser.id,
+      fromEmployeeName: displayName(s.initiatorUser),
+      toEmployeeName: displayName(s.recipientUser),
+      day: dayName(s.initiatorShift.startTime),
+      time: mealPeriod(s.initiatorShift.startTime),
+      ruleCheck: s.ruleCheck?.passed ? "pass" : "fail",
+    })),
+    staff: recentStaff.map((u) => ({
+      id: u.id,
+      name: displayName(u),
+      designation: u.designation,
+      department: u.department,
+      avatar: null,
+      status: u.isActive ? "Active" : "Inactive",
+    })),
   };
 };
 

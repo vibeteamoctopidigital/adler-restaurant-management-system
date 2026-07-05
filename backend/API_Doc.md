@@ -4,7 +4,7 @@
 
 **Health check:** `GET http://localhost:8000/health` → `{ "status": "ok", "uptime": <sec>, "timestamp": "..." }`
 
-**Status:** All 57 endpoints below are implemented and verified end-to-end (automated smoke test, all passing).
+**Status:** All 68 endpoints below are implemented and verified end-to-end (automated smoke test, all passing).
 
 **Example request (cURL):** cookie-based auth — log in once to a cookie jar, then reuse it.
 ```bash
@@ -133,15 +133,16 @@ Each file's role: **`*.route.ts`** wires paths + guards + validation → **`*.co
 6. [Admin — Shifts](#6-admin--shifts)
 7. [Admin — Shift Approvals](#7-admin--shift-approvals)
 8. [Admin — Shift Swaps](#8-admin--shift-swaps)
-9. [Admin — Reports](#9-admin--reports)
-10. [Admin — Settings](#10-admin--settings)
-11. [Admin — Availability](#11-admin--availability)
-12. [Staff — Shifts](#12-staff--shifts)
-13. [Staff — Notifications](#13-staff--notifications)
-14. [Staff — Shift Swaps](#14-staff--shift-swaps)
-15. [Staff — Availability](#15-staff--availability)
-16. [Enum Reference](#16-enum-reference)
-17. [Seed Script](#17-seed-script)
+9. [Admin — Workload](#9-admin--workload)
+10. [Admin — Reports](#10-admin--reports)
+11. [Admin — Settings](#11-admin--settings)
+12. [Admin — Availability](#12-admin--availability)
+13. [Staff — Shifts](#13-staff--shifts)
+14. [Staff — Notifications](#14-staff--notifications)
+15. [Staff — Shift Swaps](#15-staff--shift-swaps)
+16. [Staff — Availability](#16-staff--availability)
+17. [Enum Reference](#17-enum-reference)
+18. [Seed Script](#18-seed-script)
 
 ---
 
@@ -419,7 +420,7 @@ Sends an in-app notification to **every active employee** and stamps `notifiedAt
 ---
 
 ## 7. Admin — Shift Approvals
-The accept-then-confirm flow. Staff **accept** a published shift (§11); the admin then **approves** who actually works it. Only approved responses count as "available/confirmed workers".
+The accept-then-confirm flow. Staff **accept** a published shift (§13); the admin then **approves** who actually works it. Only approved responses count as "available/confirmed workers".
 
 ### `GET http://localhost:8000/api/v1/admin/shifts/approvals`  · feed
 Query: `page`, `limit`, `pendingOnly` (`true`/`false`). Returns published shifts that have volunteers.
@@ -461,7 +462,7 @@ Body (optional): `{ "note": "Enough coverage" }`. Sets `REJECTED`, notifies the 
 ---
 
 ## 8. Admin — Shift Swaps
-Employees request to swap their **confirmed** shifts (§13); the admin approves or rejects. Approval performs the exchange atomically.
+Employees request to swap their **confirmed** shifts (§15); the admin approves or rejects. Approval performs the exchange atomically.
 
 ### `GET http://localhost:8000/api/v1/admin/swaps`  · list
 Query: `page`, `limit`, `status` (`PENDING` \| `APPROVED` \| `REJECTED` \| `CANCELLED`). Each **pending** swap carries a lightweight L-GAV `ruleCheck`.
@@ -488,7 +489,119 @@ Body (optional): `{ "note": "…" }`. Sets `REJECTED`, notifies both; shifts unc
 
 ---
 
-## 9. Admin — Reports
+## 9. Admin — Workload
+Base path `/admin/workload`. The **Workload** page is where the admin plans **how many people each category needs for each shift**, week by week, then uploads (publishes) it. A workload **week** is a `WeeklyPlan`; its rows are **staffing demands** (`StaffingDemand`) — one per *category + day + time slot* carrying a `requiredCount`. Demands are **connected to the shifts the admin creates** (§6, `ShiftOffer`): every demand reports how many of its required workers are already covered.
+
+> Built on the pre-existing `WeeklyPlan` / `StaffingDemand` models — **no schema change**. (The auto-roster constraint-solver on top of this remains deferred; this feature delivers demand entry, per-category headcount, week management, and the shift-coverage view.)
+
+### Shift ⇄ workload connection
+A shift the admin created (`ShiftOffer`) **fulfils** a demand when it shares the **category**, falls on the **same calendar day**, and **overlaps** the demand's time slot. "Filled" headcount = admin-**APPROVED** workers across those shifts. Every demand is returned annotated:
+```json
+"fulfillment": { "requiredCount": 3, "filledCount": 1, "pendingCount": 0, "openCount": 2, "status": "PARTIAL" },
+"connectedShifts": [ { "id": "…", "jobTitle": "Evening Waiter", "startTime": "…", "endTime": "…",
+                      "notified": true, "approvedCount": 1, "pendingCount": 0 } ]
+```
+`fulfillment.status` = `OPEN` (0 filled) · `PARTIAL` (some) · `MET` (filled ≥ required).
+
+### `POST http://localhost:8000/api/v1/admin/workload/weeks`  · create a workload week
+```json
+{ "weekStartDate": "2026-11-02", "weekNumber": 45 }
+```
+| Field | Required | Rules |
+|-------|----------|-------|
+| `weekStartDate` | ✅ | a date (or ISO date-time) — the week's first day. `year`, `month`, and `weekEndDate` (+6 days) are derived from it |
+| `weekNumber` | — | int 1–53; defaults to the **ISO week number** of `weekStartDate` |
+
+`201`:
+```json
+{ "success": true, "message": "Workload week created successfully.",
+  "data": { "week": { "id": "…", "year": 2026, "month": 11, "weekNumber": 45,
+    "weekStartDate": "2026-11-02T00:00:00.000Z", "weekEndDate": "2026-11-08T00:00:00.000Z",
+    "status": "DRAFT", "submittedAt": null, "needsRenotify": false, "createdAt": "…", "updatedAt": "…" } } }
+```
+`409` if a week with the same `year` + `month` + `weekNumber` already exists.
+
+### `GET http://localhost:8000/api/v1/admin/workload/weeks`  · list weeks
+Query: `page`, `limit` (default 20), `year`, `month`, `status` (`DRAFT` \| `SUBMITTED` \| `PUBLISHED`). Each row adds `demandCount` and `totalRequired`.
+```json
+{ "success": true, "data": { "weeks": [
+    { "id": "…", "year": 2026, "month": 11, "weekNumber": 45, "status": "DRAFT",
+      "weekStartDate": "…", "weekEndDate": "…", "demandCount": 4, "totalRequired": 11, … } ] },
+  "meta": { "pagination": { "page": 1, "limit": 20, "total": 1, "totalPages": 1 } } }
+```
+
+### `GET http://localhost:8000/api/v1/admin/workload/weeks/:planId`  · one week (full, with fulfillment)
+Returns the week, all its demands (each annotated with `fulfillment` + `connectedShifts`), the same demands **grouped by category**, and week `totals`.
+```json
+{ "success": true, "data": {
+    "week": { "id": "…", "weekNumber": 45, "status": "DRAFT", … },
+    "totals": { "demandCount": 1, "totalRequired": 2, "totalFilled": 1, "totalOpen": 1 },
+    "categories": [
+      { "category": { "id": "…", "name": "Service" }, "totalRequired": 2, "totalFilled": 1,
+        "demands": [
+          { "id": "…", "weeklyPlanId": "…", "date": "2026-11-03", "categoryId": "…", "requiredCount": 2,
+            "startTime": "2026-11-03T11:00:00.000Z", "endTime": "2026-11-03T15:00:00.000Z", "note": "lunch service",
+            "category": { "id": "…", "name": "Service" },
+            "fulfillment": { "requiredCount": 2, "filledCount": 1, "pendingCount": 0, "openCount": 1, "status": "PARTIAL" },
+            "connectedShifts": [ { "id": "…", "jobTitle": "Evening Waiter", "startTime": "…", "endTime": "…", "notified": true, "approvedCount": 1, "pendingCount": 0 } ] } ] } ],
+    "demands": [ "… the same demand objects, flat …" ] } }
+```
+`404` if the week doesn't exist.
+
+### `PATCH http://localhost:8000/api/v1/admin/workload/weeks/:planId`  · update week
+Body — any subset: `{ "status": "SUBMITTED", "needsRenotify": true }`. `status` is `DRAFT` \| `SUBMITTED` \| `PUBLISHED`; setting `SUBMITTED` stamps `submittedAt`. `200` → the week. `404` if not found.
+
+### `POST http://localhost:8000/api/v1/admin/workload/weeks/:planId/publish`  · upload (publish) the workload
+Sets `status = PUBLISHED`. `200` → the week. `409` if the week has **no demands** ("Cannot upload an empty workload…"). `404` if not found.
+
+### `DELETE http://localhost:8000/api/v1/admin/workload/weeks/:planId`
+`200` `{ "message": "Workload week deleted successfully." }` (its demands cascade). `404` if not found.
+
+### `POST http://localhost:8000/api/v1/admin/workload/weeks/:planId/demands`  · add a demand
+```json
+{ "date": "2026-11-03", "categoryId": "<categoryId>", "requiredCount": 2,
+  "startTime": "2026-11-03T11:00:00.000Z", "endTime": "2026-11-03T15:00:00.000Z", "note": "lunch service" }
+```
+| Field | Required | Rules |
+|-------|----------|-------|
+| `date` | ✅ | a date (or ISO date-time) — the day the demand is for |
+| `categoryId` | ✅ | must exist & be active (`404`/`409`) |
+| `requiredCount` | ✅ | int 1–1000 (people needed) |
+| `startTime`, `endTime` | ✅ | ISO 8601; `endTime` **after** `startTime` (`400`) |
+| `note` | — | ≤ 1000 chars |
+
+`201` → `{ "data": { "demand": { … } } }`. `409` if a demand for the **same category + start time on that day** already exists (unique per `[week, date, category, startTime]`).
+
+### `POST http://localhost:8000/api/v1/admin/workload/weeks/:planId/demands/bulk`  · bulk upload demands
+Upload many rows at once. Body: `{ "demands": [ { …same fields as "add a demand"… }, … ] }` — 1–500 items, each requiring `endTime > startTime`. Rows that duplicate an existing `[week, date, category, startTime]` are **skipped** (not errored).
+`201` → `{ "data": { "createdCount": 7, "skippedCount": 1 } }`. `409` if any `categoryId` doesn't exist / is inactive.
+
+### `PATCH http://localhost:8000/api/v1/admin/workload/demands/:demandId`  · edit a demand
+Any subset of the demand fields. Time bounds are re-checked on partial edits (`400` if the resulting `endTime ≤ startTime`). `200` → the demand. `404` if not found.
+
+### `DELETE http://localhost:8000/api/v1/admin/workload/demands/:demandId`
+`200` `{ "message": "Staffing demand deleted successfully." }`. `404` if not found.
+
+### `GET http://localhost:8000/api/v1/admin/workload`  · sort by day / week / month
+The main **sortable view** — returns every demand whose `date` falls in the chosen window, annotated with `fulfillment` + `connectedShifts` and grouped by category.
+| Query | Rules |
+|-------|-------|
+| `view` | `day` \| `week` \| `month` (default `week`) |
+| `date` | ✅ reference date (any day inside the target period) |
+| `categoryId` | — filter to a single category |
+
+For `week` the window is the **Monday-based** week containing `date`; for `month` it's the calendar month.
+```json
+{ "success": true, "data": {
+    "view": "week", "range": { "start": "2026-11-02", "end": "2026-11-08" },
+    "totals": { "demandCount": 4, "totalRequired": 11, "totalFilled": 3, "totalOpen": 8 },
+    "categories": [ { "category": { "id": "…", "name": "Service" }, "totalRequired": 6, "totalFilled": 2, "demands": [ … ] } ],
+    "demands": [ "… annotated demand objects, flat, ordered by date then startTime …" ] } }
+```
+
+---
+
+## 10. Admin — Reports
 ### `GET http://localhost:8000/api/v1/admin/reports`  · per-employee hours & wage
 Query: `year` (2000–2100), `month` (1–12), `categoryId`. Defaults to the current month if omitted. Hours are derived from **admin-approved** shift acceptances that fall in the month.
 ```json
@@ -511,7 +624,7 @@ Same query. Responds with `Content-Type: text/csv` and `Content-Disposition: att
 
 ---
 
-## 10. Admin — Settings
+## 11. Admin — Settings
 Single org-wide settings row — the **Settings → L-GAV rule values** and **Notifications** cards.
 
 ### `GET http://localhost:8000/api/v1/admin/settings`
@@ -555,8 +668,8 @@ Body — any subset (at least one field, else `400`):
 
 ---
 
-## 11. Admin — Availability
-Base path `/admin/availability`. The admin **opens** a month for availability collection, watches who has submitted, views individual submissions, and nudges stragglers. (Staff fill and submit from the mobile app — §14.)
+## 12. Admin — Availability
+Base path `/admin/availability`. The admin **opens** a month for availability collection, watches who has submitted, views individual submissions, and nudges stragglers. (Staff fill and submit from the mobile app — §16.)
 
 ### `POST http://localhost:8000/api/v1/admin/availability/open`  · open a month
 Creates an availability slot for **every active employee** for the month (existing slots keep what's filled and just get the new cut-off).
@@ -593,7 +706,7 @@ Body: `{ "year": 2026, "month": 12 }`. Sends the employee an `AVAILABILITY_REMIN
 
 ---
 
-## 12. Staff — Shifts
+## 13. Staff — Shifts
 Base path `/shifts`. Staff-guarded (mobile app). Only **published** shifts (notified) are ever visible here.
 
 ### `GET http://localhost:8000/api/v1/shifts`  · available shifts
@@ -617,7 +730,7 @@ Errors: `400` bad enum · `404` shift not published · `409` shift already ended
 
 ---
 
-## 13. Staff — Notifications
+## 14. Staff — Notifications
 Base path `/notifications`. Staff-guarded. Scoped to the caller.
 
 ### `GET http://localhost:8000/api/v1/notifications`
@@ -638,7 +751,7 @@ Notification `type` values you'll see: `SHIFT_OFFER_PUBLISHED` (new shift), `SHI
 
 ---
 
-## 14. Staff — Shift Swaps
+## 15. Staff — Shift Swaps
 Base path `/swaps`. Staff-guarded (mobile app). Employees request to swap their **confirmed** shifts.
 
 ### `POST http://localhost:8000/api/v1/swaps`  · request a swap
@@ -658,7 +771,7 @@ Query: `page`, `limit`, `status`, `role` (`initiated` \| `received`). Returns sw
 
 ---
 
-## 15. Staff — Availability
+## 16. Staff — Availability
 Base path `/availability`. Staff-guarded (mobile app). Employees record their availability & wishes for a month the admin has opened, then submit bindingly before the cut-off.
 
 ### `GET http://localhost:8000/api/v1/availability/:year/:month`  · my availability
@@ -697,7 +810,7 @@ Moves `DRAFT → SUBMITTED` and stamps `submittedAt`. After this the month is re
 
 ---
 
-## 16. Enum Reference
+## 17. Enum Reference
 
 | Enum | Values |
 |------|--------|
@@ -707,13 +820,14 @@ Moves `DRAFT → SUBMITTED` and stamps `submittedAt`. After this the month is re
 | `ShiftResponseStatus` (staff accept/decline) | `ACCEPTED`, `REJECTED` |
 | `ShiftApprovalStatus` (admin decision) | `PENDING`, `APPROVED`, `REJECTED` |
 | `ShiftSwapStatus` | `PENDING`, `APPROVED`, `REJECTED`, `CANCELLED` |
+| `PlanStatus` (workload week) | `DRAFT`, `SUBMITTED`, `PUBLISHED` |
 | `NotificationType` | `SHIFT_OFFER_PUBLISHED`, `SHIFT_CHANGED`, `SWAP_REQUEST_RECEIVED`, `SWAP_REQUEST_RESULT`, `WEEKLY_SHIFTS_PUBLISHED`, `AVAILABILITY_REMINDER`, `RULE_VIOLATION`, `GENERAL` |
 | `NotificationChannel` | `PUSH`, `EMAIL`, `IN_APP` |
 | `NotificationStatus` | `PENDING`, `SENT`, `FAILED`, `READ` |
 
 ---
 
-## 17. Seed Script
+## 18. Seed Script
 
 Create the default admin (idempotent):
 ```bash
@@ -735,6 +849,7 @@ Credentials: **`admin@adler.com`** / **`Admin@123456`** (change after first logi
 | Admin — Shifts | 6 |
 | Admin — Shift Approvals | 4 |
 | Admin — Shift Swaps | 3 |
+| Admin — Workload | 11 |
 | Admin — Reports | 2 |
 | Admin — Settings | 2 |
 | Admin — Availability | 4 |
@@ -742,6 +857,6 @@ Credentials: **`admin@adler.com`** / **`Admin@123456`** (change after first logi
 | Staff — Notifications | 3 |
 | Staff — Shift Swaps | 3 |
 | Staff — Availability | 3 |
-| **Total** | **57** |
+| **Total** | **68** |
 
-> **Not yet implemented (deferred scheduling engine):** the weekly-plan auto-generation ("Manage Plans") — turning demand + submitted availability into a rule-compliant proposed roster, with hand-adjustment and per-change L-GAV feedback. Employee **availability collection is now implemented** (§11 & §15); what remains is the constraint-solving/roster-generation layer on top of it, plus the legacy `WeeklyPlan`-based models. Also open (not blocking): "open to the whole team" swaps (current swaps are targeted) and actual clock-in/out worked-hours capture (reports currently derive hours from approved shifts). Tracked in `implimated.md`.
+> **Not yet implemented (deferred scheduling engine):** the weekly-plan **auto-generation** ("Manage Plans") — automatically turning workload demand + submitted availability into a rule-compliant proposed roster, with hand-adjustment and per-change L-GAV feedback. The **workload / staffing-demand layer is now implemented** (§9, built on the `WeeklyPlan` / `StaffingDemand` models) and employee **availability collection** too (§12 & §16); what remains is only the constraint-solving/roster-generation engine that consumes them. Also open (not blocking): "open to the whole team" swaps (current swaps are targeted) and actual clock-in/out worked-hours capture (reports currently derive hours from approved shifts). Tracked in `implimated.md`.

@@ -370,3 +370,52 @@ The **weekly-plan auto-scheduling engine** ("Manage Plans" — turn demand + the
 
 ### Endpoint count: **57** (added 4 admin + 3 staff availability), all working.
 
+## 15. Admin **Workload** — Weekly Staffing Demand + Shift Coverage
+
+Implements the **Workload** page: the admin plans **how many people each category needs for each shift**, week by week, edits it freely, and **uploads (publishes)** it — and the workload is **connected to the shifts the admin already created** so each demand shows how much of its required headcount is covered.
+
+> **Design note — built on the pre-existing `WeeklyPlan` / `StaffingDemand` models, no schema change.** These two models already existed (part of the previously-deferred scheduling engine) and are a perfect fit: a `WeeklyPlan` is the *week container* and each `StaffingDemand` is exactly "for this category, on this day, for this shift slot, we need N people" (`@@unique([weeklyPlanId, date, categoryId, startTime])`). So the feature was built directly on them rather than adding new tables. The remaining deferred piece is only the **auto-roster constraint-solver** that would turn demand + availability into a proposed roster; everything else of the workload surface (week CRUD, per-category demand entry, bulk upload, publish, day/week/month sorting, and live shift-coverage) is now implemented. The functional shift model stays `ShiftOffer` (the admin-created shift from §9/§10); demands connect to it by category + day + time overlap.
+
+### No schema / migration change
+`WeeklyPlan` and `StaffingDemand` were already in the migrations and the generated Prisma client. Confirmed both tables + models exist; **nothing was added or pushed**.
+
+### Shift ⇄ workload connection (the core logic)
+A `ShiftOffer` **fulfils** a demand when it shares the **category**, falls on the **same calendar day**, and **overlaps** the demand's `[startTime, endTime)`. "Filled" headcount = admin-**APPROVED** workers across those shifts. Every demand is returned annotated with `fulfillment { requiredCount, filledCount, pendingCount, openCount, status }` (status `OPEN`/`PARTIAL`/`MET`) and the `connectedShifts[]` that feed it. This makes "the shift the admin created is available in the workload" literal — the created shifts show up inside each demand with their approved/pending counts.
+
+### Admin Workload Module (`src/modules/admin/workload/`, `/api/v1/admin/workload`)
+Follows the standard `validation → route → controller → service` pattern, admin-guarded at the router level, Zod-validated.
+| File | Purpose |
+|------|---------|
+| `workload.validation.ts` | Zod schemas: create-week (`weekStartDate` + optional `weekNumber`), update-week (`status`/`needsRenotify`), list-weeks query, create-demand + **bulk** demands (1–500) + update-demand (all with `endTime > startTime` refinement), and the day/week/month **view** query. A shared `dateString` accepts either a date-only (`2026-11-03`) or a full ISO date-time. |
+| `workload.service.ts` | All business logic + Prisma. UTC date helpers (`startOfUTCDay`, `addDays`, ISO `isoWeekNumber`), `annotateDemands` (the shift-coverage join), `groupByCategory`, `computeTotals`, and the eleven operations below. Category/plan existence guards mirror the shifts module. |
+| `workload.controller.ts` | HTTP controllers (thin; `sendSuccess`, param reads, `res.locals.auth`). |
+| `workload.route.ts` | 11 routes, all `authenticate` + `authorizeAdmin`. |
+
+**Weeks (workload containers):**
+- `POST /weeks` — create a week from `weekStartDate`; derives `year`/`month`/`weekEndDate` (+6 days) and `weekNumber` (ISO week number, overridable). `409` on duplicate `year+month+weekNumber`.
+- `GET /weeks` — paginated list, filters `year`/`month`/`status`, each row with `demandCount` + `totalRequired`.
+- `GET /weeks/:planId` — full week: demands annotated with `fulfillment` + `connectedShifts`, the same demands **grouped by category**, and week `totals`.
+- `PATCH /weeks/:planId` — update `status` (stamps `submittedAt` on `SUBMITTED`) / `needsRenotify`.
+- `POST /weeks/:planId/publish` — **upload**: sets `status=PUBLISHED`; `409` if the week has no demands.
+- `DELETE /weeks/:planId` — deletes the week (demands cascade).
+
+**Demands (the workload rows):**
+- `POST /weeks/:planId/demands` — add one (category active-check; up-front duplicate guard on `[week, date, category, startTime]` → `409`).
+- `POST /weeks/:planId/demands/bulk` — **bulk upload**: validates all categories, `createMany` with `skipDuplicates`, returns `{ createdCount, skippedCount }`.
+- `PATCH /demands/:demandId` — edit any field; re-checks the time bounds on partial edits.
+- `DELETE /demands/:demandId` — remove one.
+
+**Sortable view:**
+- `GET /admin/workload?view=day|week|month&date=&categoryId=` — returns every demand whose `date` falls in the day / **Monday-based** week / calendar month window, annotated with coverage and grouped by category, with a `range` and `totals`. This is the "sort it using day, week and month" requirement.
+
+### Route Wiring (`src/routes/index.route.ts`)
+Mounted `workloadRouter` at `/admin/workload` (one import + one `indexRouter.use`).
+
+### Verification
+- `npx tsc --noEmit` → **0 errors** (strict mode, incl. `exactOptionalPropertyTypes` + `noUncheckedIndexedAccess`). One strict-mode fix: the `endAfterStart` refine predicate's parameter type needed `string | undefined` to satisfy `exactOptionalPropertyTypes`.
+- Module graph loads cleanly and all **11 routes register** (verified by introspecting the router stack).
+- **Full E2E against the live DB**, all confirmed: create week (`2026-11-02` → `year:2026, month:11, weekNumber:45`, `weekEndDate` +6d, `DRAFT`) → add demand (need 2) → **duplicate demand → 409** → create a matching `ShiftOffer` + one **APPROVED** worker → week detail shows `connectedShifts:[{approved:1}]`, `fulfillment {filledCount:1, openCount:1, status:"PARTIAL"}` and correct category grouping → **day / week / month views** return correct `range`s (`11-03`, `11-02..11-08`, `11-01..11-30`) and demand counts (a different day → empty) → **bulk upload** = `{createdCount:1, skippedCount:1}` (one row duplicated an existing slot) → update demand (required→5) → **publish → PUBLISHED** → `listWeeks` filtered by year/month returns `demandCount` + `totalRequired`. All test data cleaned up afterwards.
+
+### New Endpoint Count (this iteration)
+**11 new admin endpoints** (6 weeks + 4 demands + 1 day/week/month view). **Total project endpoints: 68.**
+

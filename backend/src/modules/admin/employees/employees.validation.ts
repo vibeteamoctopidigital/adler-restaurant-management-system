@@ -64,8 +64,10 @@ export const userIdParamSchema = z.object({
 });
 
 export const listUsersQuerySchema = z.object({
-  page: z.coerce.number().int().min(1).default(1),
   limit: z.coerce.number().int().min(1).max(100).default(10),
+  // Opaque keyset cursor taken from a previous page's `nextCursor`.
+  // Omit it to fetch the first page.
+  cursor: z.string().min(1).optional(),
   isActive: z
     .enum(["true", "false"])
     .transform((val) => val === "true")

@@ -46,6 +46,16 @@ const flattenUser = <
   return { ...rest, categories: categories.map((c) => c.category) };
 };
 
+// Opaque keyset cursor: base64url of a user's `id`. The list is ordered by
+// (createdAt desc, id desc); `id` — a unique column — is the tiebreaker Prisma
+// keys the cursor on, so pages stay stable even when two rows share createdAt.
+const encodeCursor = (id: string) => Buffer.from(id, "utf8").toString("base64url");
+const decodeCursor = (cursor: string): string => {
+  const id = Buffer.from(cursor, "base64url").toString("utf8");
+  if (!id) throw new AppError("Invalid pagination cursor.", 400);
+  return id;
+};
+
 // Guard that every referenced category exists before assigning.
 const assertCategoriesExist = async (categoryIds: string[]) => {
   if (categoryIds.length === 0) return;
@@ -256,16 +266,15 @@ const activateUser = async (userId: string) => {
   return user;
 };
 
-// ─── Get All Users ───────────────────────────────────────────────
+// ─── Get All Users (cursor / keyset pagination) ──────────────────
 const getAllUsers = async (query: {
-  page: number;
   limit: number;
+  cursor?: string;
   isActive?: boolean;
   search?: string;
   categoryId?: string;
 }) => {
-  const { page, limit, isActive, search, categoryId } = query;
-  const skip = (page - 1) * limit;
+  const { limit, cursor, isActive, search, categoryId } = query;
 
   const where: Prisma.UserWhereInput = {};
 
@@ -288,17 +297,34 @@ const getAllUsers = async (query: {
     ];
   }
 
+  // Resolve + validate the cursor up-front so a stale/garbage cursor returns a
+  // clean 400 instead of a raw Prisma "cursor does not exist" error.
+  let cursorId: string | undefined;
+  if (cursor) {
+    cursorId = decodeCursor(cursor);
+    const exists = await prisma.user.findUnique({
+      where: { id: cursorId },
+      select: { id: true },
+    });
+    if (!exists) {
+      throw new AppError("Invalid or expired pagination cursor.", 400);
+    }
+  }
+
   // Active/inactive tallies power the "11 active · 1 inactive" header. They are
   // computed over the same filters EXCEPT the isActive filter itself.
   const countWhere: Prisma.UserWhereInput = { ...where };
   delete countWhere.isActive;
 
-  const [users, total, activeCount, inactiveCount] = await Promise.all([
+  // Fetch one extra row beyond `limit` to detect whether another page follows.
+  const [rows, activeCount, inactiveCount] = await Promise.all([
     prisma.user.findMany({
       where,
-      skip,
-      take: limit,
-      orderBy: { createdAt: "desc" },
+      take: limit + 1,
+      ...(cursorId ? { cursor: { id: cursorId }, skip: 1 } : {}),
+      // A unique tiebreaker (id) makes the ordering total, which keyset
+      // pagination requires to never skip or repeat a row.
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
       select: {
         id: true,
         email: true,
@@ -323,20 +349,19 @@ const getAllUsers = async (query: {
         },
       },
     }),
-    prisma.user.count({ where }),
     prisma.user.count({ where: { ...countWhere, isActive: true } }),
     prisma.user.count({ where: { ...countWhere, isActive: false } }),
   ]);
 
+  const hasNextPage = rows.length > limit;
+  const pageRows = hasNextPage ? rows.slice(0, limit) : rows;
+  const lastRow = pageRows[pageRows.length - 1];
+  const nextCursor = hasNextPage && lastRow ? encodeCursor(lastRow.id) : null;
+
   return {
-    users: users.map(flattenUser),
+    users: pageRows.map(flattenUser),
     counts: { active: activeCount, inactive: inactiveCount },
-    pagination: {
-      page,
-      limit,
-      total,
-      totalPages: Math.ceil(total / limit),
-    },
+    pagination: { limit, nextCursor, hasNextPage },
   };
 };
 

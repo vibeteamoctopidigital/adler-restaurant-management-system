@@ -89,10 +89,15 @@ Two shapes exist:
 | `500` | Server error |
 
 ### Pagination
-List endpoints accept `page` (default `1`) and `limit` and return:
+Most list endpoints use **offset** pagination — they accept `page` (default `1`) and `limit`, and return:
 ```json
 "meta": { "pagination": { "page": 1, "limit": 20, "total": 42, "totalPages": 3 } }
 ```
+The **Employees** list (§4) instead uses **cursor (keyset)** pagination for stable, drift-free scrolling. It accepts `limit` + an opaque `cursor` and returns:
+```json
+"meta": { "pagination": { "limit": 10, "nextCursor": "Y21yN2s0b3B2MDAwMg", "hasNextPage": true } }
+```
+Fetch the first page without a cursor, then pass the returned `nextCursor` back as `?cursor=…` for each subsequent page. The end is reached when `hasNextPage` is `false` (and `nextCursor` is `null`). A malformed or stale cursor → `400`.
 
 ### Project structure
 The backend is organized **one folder per feature**, each folder self-contained with its `route`, `controller`, `service`, and `validation` files:
@@ -300,8 +305,18 @@ Base path `/admin/users`. All routes are admin-guarded.
 
 Errors: `400` invalid / unknown category · `409` duplicate email.
 
-### `GET http://localhost:8000/api/v1/admin/users`  · list employees
-Query: `page`, `limit` (≤100, default 10), `isActive` (`true`/`false`), `search` (matches name/email/department/designation), `categoryId`.
+### `GET http://localhost:8000/api/v1/admin/users`  · list employees · **cursor pagination**
+Uses **cursor (keyset)** pagination — the list is ordered **newest-first** (`createdAt`, then `id` as a unique tiebreaker), so rows are never skipped or repeated even as employees are added/removed between page loads.
+
+Query:
+| Param | Rules |
+|-------|-------|
+| `limit` | int 1–100 (default 10) — page size |
+| `cursor` | opaque token from the previous page's `nextCursor`; omit for the first page. Malformed/stale → `400` |
+| `isActive` | `true` / `false` |
+| `search` | matches name / email / firstName / lastName / department / designation |
+| `categoryId` | employees assigned to this category |
+
 ```json
 { "success": true, "data": {
     "users": [ { "id": "…", "email": "…", "name": "Anna Müller", "phone": "…", "department": "…",
@@ -310,9 +325,10 @@ Query: `page`, `limit` (≤100, default 10), `isActive` (`true`/`false`), `searc
       "lastLoginAt": "…", "hireDate": "…", "createdAt": "…",
       "categories": [ { "id": "…", "name": "Service", "parentId": null } ] } ],
     "counts": { "active": 11, "inactive": 1 } },
-  "meta": { "pagination": { "page": 1, "limit": 10, "total": 12, "totalPages": 2 } } }
+  "meta": { "pagination": { "limit": 10, "nextCursor": "Y21yN2s0b3B2MDAwMg", "hasNextPage": true } } }
 ```
-> `counts` reflects the same filters **except** `isActive`, so it always shows the full active/inactive split ("11 active · 1 inactive").
+- **Paging:** repeat the request with `?cursor=<nextCursor>` until `hasNextPage` is `false` (then `nextCursor` is `null`). `cursor` composes with `limit`/`isActive`/`search`/`categoryId` — keep the filters identical across pages.
+- `counts` reflects the same filters **except** `isActive`, so it always shows the full active/inactive split ("11 active · 1 inactive") and doubles as the total tally.
 
 ### `GET http://localhost:8000/api/v1/admin/users/:userId`  · get one
 Full profile incl. `categories`. `404` if not found.

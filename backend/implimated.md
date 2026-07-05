@@ -419,3 +419,25 @@ Mounted `workloadRouter` at `/admin/workload` (one import + one `indexRouter.use
 ### New Endpoint Count (this iteration)
 **11 new admin endpoints** (6 weeks + 4 demands + 1 day/week/month view). **Total project endpoints: 68.**
 
+## 16. Employees List — **Cursor (Keyset) Pagination**
+
+Switched the admin **Employees** list (`GET /api/v1/admin/users`) from offset (`page`/`skip`) pagination to **cursor (keyset)** pagination. Offset pagination re-scans and skips `(page-1)*limit` rows on every request (slower as the list grows) and **drifts** — when an employee is added or removed between page loads, rows shift and the viewer sees a duplicate or misses one. Keyset pagination anchors each page to the last row of the previous one, so it stays O(limit) and never skips/repeats. No other endpoint changed; no schema change.
+
+### What changed (`src/modules/admin/employees/`)
+- **`employees.validation.ts`** — `listUsersQuerySchema` drops `page` and adds an optional opaque **`cursor`** string; `limit` (1–100, default 10) and the `isActive` / `search` / `categoryId` filters are unchanged.
+- **`employees.service.ts`** — `getAllUsers` rewritten:
+  - **Stable total ordering:** `orderBy: [{ createdAt: "desc" }, { id: "desc" }]`. The unique `id` tiebreaker makes the sort total, which keyset pagination requires to never skip or duplicate a row when `createdAt` values collide.
+  - **Opaque cursor:** `encodeCursor`/`decodeCursor` base64url-encode the row `id` (so the client treats it as opaque, not a guessable id). A malformed cursor → `400`.
+  - **Cursor resolve + guard:** when a cursor is supplied it is decoded and its row is existence-checked up-front; a **stale/deleted** cursor returns a clean `400 "Invalid or expired pagination cursor."` instead of a raw Prisma "cursor does not exist" error.
+  - **Next-page detection:** fetches `take: limit + 1` (with `cursor: { id }, skip: 1` when paging); if the extra row is present, `hasNextPage = true` and `nextCursor` = the last kept row's encoded id, else `nextCursor = null`.
+  - **Preserved:** the `counts { active, inactive }` tallies (computed over the same filters minus `isActive`) — they still power the "N active · M inactive" header and serve as the total tally.
+  - Response `meta.pagination` is now `{ limit, nextCursor, hasNextPage }` (was `{ page, limit, total, totalPages }`).
+- **`employees.controller.ts`** — `getAllUsers` forwards `cursor` instead of `page` (imperative build, safe under `exactOptionalPropertyTypes`).
+
+### Verification
+- `npx tsc --noEmit` → **0 errors** (strict mode).
+- **Full E2E against the live DB**, all confirmed: seed 5 employees (3 inactive, 2 active) → page at `limit=2` → **3 pages return all 5 exactly once, no skips/overlaps** (`hasNextPage` flips to `false` and `nextCursor` to `null` on the last page) → **order is newest-first** and stable → **`counts {active:2, inactive:3}`** correct on every page → **filter + cursor compose** (active-only paging at `limit=1` returns the 2 distinct active users, then `hasNextPage:false`) → **malformed cursor → 400** → **stale cursor** (valid base64url of a non-existent id) **→ 400**. All test data cleaned up afterwards.
+
+### Endpoint Count
+Unchanged — **68 endpoints**. This is a behavioural upgrade to the existing `GET /admin/users`, not a new route. Its `meta.pagination` shape changed from offset to cursor (documented in `API_Doc.md` §4 + the Pagination conventions).
+

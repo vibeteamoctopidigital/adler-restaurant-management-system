@@ -1,33 +1,37 @@
 import { Router } from "express";
-import adminAuthRouter from "../modules/admin/admin.route";
-import userAuthRouter from "../modules/user/user.route";
-import userManagementRouter from "../modules/admin/user-management.route";
-import categoryRouter from "../modules/admin/category.route";
-import adminShiftRouter from "../modules/admin/shift.route";
-import reportRouter from "../modules/admin/report.route";
-import overviewRouter from "../modules/admin/overview.route";
-import settingsRouter from "../modules/admin/settings.route";
-import adminSwapRouter from "../modules/admin/swap.route";
-import userShiftRouter from "../modules/user/shift.route";
-import notificationRouter from "../modules/user/notification.route";
-import userSwapRouter from "../modules/user/swap.route";
+
+// ── Admin feature routers ──────────────────────────────────────────
+import adminAuthRouter from "../modules/admin/auth/auth.route";
+import overviewRouter from "../modules/admin/overview/overview.route";
+import employeesRouter from "../modules/admin/employees/employees.route";
+import categoryRouter from "../modules/admin/categories/categories.route";
+import adminShiftRouter from "../modules/admin/shifts/shifts.route";
+import reportRouter from "../modules/admin/reports/reports.route";
+import settingsRouter from "../modules/admin/settings/settings.route";
+import adminSwapRouter from "../modules/admin/swaps/swaps.route";
+
+// ── Staff (user) feature routers ───────────────────────────────────
+import userAuthRouter from "../modules/user/auth/auth.route";
+import userShiftRouter from "../modules/user/shifts/shifts.route";
+import notificationRouter from "../modules/user/notifications/notifications.route";
+import userSwapRouter from "../modules/user/swaps/swaps.route";
 
 const indexRouter = Router();
 
-// Auth routes
+// ── Authentication ─────────────────────────────────────────────────
 indexRouter.use("/auth/admin", adminAuthRouter);
 indexRouter.use("/auth/user", userAuthRouter);
 
-// Admin management routes
+// ── Admin management ───────────────────────────────────────────────
 indexRouter.use("/admin/overview", overviewRouter);
-indexRouter.use("/admin/users", userManagementRouter);
+indexRouter.use("/admin/users", employeesRouter);
 indexRouter.use("/admin/categories", categoryRouter);
 indexRouter.use("/admin/shifts", adminShiftRouter);
 indexRouter.use("/admin/reports", reportRouter);
 indexRouter.use("/admin/settings", settingsRouter);
 indexRouter.use("/admin/swaps", adminSwapRouter);
 
-// Staff (user) routes
+// ── Staff (mobile) ─────────────────────────────────────────────────
 indexRouter.use("/shifts", userShiftRouter);
 indexRouter.use("/notifications", notificationRouter);
 indexRouter.use("/swaps", userSwapRouter);

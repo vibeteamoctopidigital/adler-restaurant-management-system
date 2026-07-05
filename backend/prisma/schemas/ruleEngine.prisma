@@ -5,6 +5,7 @@ model OrgSettings {
   maxWeeklyHours            Decimal @db.Decimal(4, 2)
   minRestHoursBetweenShifts Decimal @db.Decimal(4, 2)
   minBreakMinutes           Int
+  breakRequiredAfterHours   Decimal @default(5.50) @db.Decimal(4, 2)
   breakRules                Json?
 
   sessionTimeoutMinutes Int   @default(30)

@@ -4,6 +4,7 @@ model Admin {
   passwordHash String
   isActive     Boolean   @default(true)
   lastLoginAt  DateTime?
+  name         String?
   firstName    String?
   lastName     String?
   createdAt    DateTime  @default(now())

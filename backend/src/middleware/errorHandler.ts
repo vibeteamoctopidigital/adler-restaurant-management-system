@@ -28,7 +28,7 @@ export const errorHandler = (err: any, _req: Request, res: Response, _next: Next
   // Send final response
   res.status(statusCode).json({
     success: false,
-    message:errorMessages || message,
+    message: message || errorMessages,
     errorDetails: {
       originalMessage: process.env.NODE_ENV === "development" ? errorMessages : undefined,
     },

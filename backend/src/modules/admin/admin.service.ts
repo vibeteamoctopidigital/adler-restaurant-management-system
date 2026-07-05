@@ -18,7 +18,7 @@ const loginAdmin = async (email: string, password: string) => {
     throw new AppError("This admin account has been deactivated.", 403);
   }
 
-  // 3. Verify password
+ // 3. Verify password
   const isPasswordValid = await verifyPassword(password, admin.passwordHash);
   if (!isPasswordValid) {
     throw new AppError("Invalid email or password.", 401);

@@ -72,19 +72,26 @@ export const activateUser = async (req: Request, res: Response): Promise<void> =
 export const getAllUsers = async (req: Request, res: Response): Promise<void> => {
   const validated = req.validated as ListUsersQuery;
 
-  const query: { page: number; limit: number; isActive?: boolean; search?: string } = {
+  const query: {
+    page: number;
+    limit: number;
+    isActive?: boolean;
+    search?: string;
+    categoryId?: string;
+  } = {
     page: validated.page,
     limit: validated.limit,
   };
   if (validated.isActive !== undefined) query.isActive = validated.isActive;
   if (validated.search !== undefined) query.search = validated.search;
+  if (validated.categoryId !== undefined) query.categoryId = validated.categoryId;
 
   const result = await userManagementServices.getAllUsers(query);
 
   sendSuccess(res, {
     statusCode: 200,
     message: "Users fetched successfully.",
-    data: { users: result.users },
+    data: { users: result.users, counts: result.counts },
     meta: { pagination: result.pagination },
   });
 };

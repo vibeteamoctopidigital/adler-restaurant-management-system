@@ -12,6 +12,7 @@ enum DayAvailabilityStatus {
 
 enum NotificationType {
   WEEKLY_SHIFTS_PUBLISHED
+  SHIFT_OFFER_PUBLISHED
   AVAILABILITY_REMINDER
   SWAP_REQUEST_RECEIVED
   SWAP_REQUEST_RESULT
@@ -71,4 +72,27 @@ enum ContractType {
   HOURLY
   MONTHLY_SALARY
   WORKLOAD_PERCENT
+}
+
+enum EmployeeType {
+  FULL_TIME
+  PART_TIME
+}
+
+enum ShiftResponseStatus {
+  ACCEPTED
+  REJECTED
+}
+
+enum ShiftApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum ShiftSwapStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
 }

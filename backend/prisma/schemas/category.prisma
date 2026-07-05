@@ -12,6 +12,7 @@ model Category {
   users         UserCategory[]
   shifts        Shift[]
   staffingNeeds StaffingDemand[]
+  shiftOffers   ShiftOffer[]
 
   @@unique([parentId, name])
   @@index([parentId])

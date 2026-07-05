@@ -15,6 +15,9 @@ model Admin {
   auditLogs            AuditLog[]           @relation("AuditActor")
   deliveredCredentials CredentialDelivery[] @relation("DeliveredBy")
   ruleCheckLogs        RuleCheckLog[]       @relation("RuleCheckActor")
+  createdShiftOffers   ShiftOffer[]         @relation("ShiftOfferCreatedBy")
+  approvedResponses    ShiftOfferResponse[] @relation("ResponseApprovedBy")
+  reviewedShiftSwaps   ShiftSwapRequest[]   @relation("ShiftSwapReviewedBy")
 
   @@index([isActive])
   @@index([lastName, firstName])

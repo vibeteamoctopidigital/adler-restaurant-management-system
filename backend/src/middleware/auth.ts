@@ -53,3 +53,19 @@ export const authorizeAdmin = (_req: Request, res: Response, next: NextFunction)
 
   next();
 };
+
+/**
+ * Authorize User — must be used AFTER authenticate.
+ * Rejects with 403 if the authenticated principal is not a staff user.
+ */
+export const authorizeUser = (_req: Request, res: Response, next: NextFunction): void => {
+  if (!res.locals.auth || res.locals.auth.role !== "USER") {
+    sendError(res, {
+      statusCode: 403,
+      message: "Access denied. Staff account required.",
+    });
+    return;
+  }
+
+  next();
+};

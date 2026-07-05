@@ -4,6 +4,58 @@ import { AppError } from "../../utils/AppError";
 import type { CreateUserInput, UpdateUserInput } from "./user-management.validation";
 import type { Prisma } from "../../generated/prisma/client";
 
+// Shared projection so password hashes are never returned in API responses.
+const userSelect = {
+  id: true,
+  email: true,
+  name: true,
+  firstName: true,
+  lastName: true,
+  phone: true,
+  address: true,
+  department: true,
+  designation: true,
+  employeeType: true,
+  contractType: true,
+  workloadPercent: true,
+  hourlyRate: true,
+  monthlySalary: true,
+  contractedHoursMonthly: true,
+  hireDate: true,
+  isActive: true,
+  mustChangePassword: true,
+  lastLoginAt: true,
+  deactivatedAt: true,
+  createdAt: true,
+  updatedAt: true,
+  categories: {
+    select: { category: { select: { id: true, name: true, parentId: true } } },
+    orderBy: { assignedAt: "asc" },
+  },
+} satisfies Prisma.UserSelect;
+
+// Flatten the UserCategory join rows into a plain category array for the client.
+const flattenUser = <
+  T extends {
+    categories: { category: { id: string; name: string; parentId: string | null } }[];
+  }
+>(
+  user: T
+) => {
+  const { categories, ...rest } = user;
+  return { ...rest, categories: categories.map((c) => c.category) };
+};
+
+// Guard that every referenced category exists before assigning.
+const assertCategoriesExist = async (categoryIds: string[]) => {
+  if (categoryIds.length === 0) return;
+  const unique = [...new Set(categoryIds)];
+  const found = await prisma.category.count({ where: { id: { in: unique } } });
+  if (found !== unique.length) {
+    throw new AppError("One or more selected categories do not exist.", 400);
+  }
+};
+
 // ─── Create User ─────────────────────────────────────────────────
 const createUser = async (data: CreateUserInput) => {
   // 1. Check if email already exists
@@ -25,9 +77,15 @@ const createUser = async (data: CreateUserInput) => {
     mustChangePassword: true,
   };
 
+  if (data.name !== undefined) createData.name = data.name;
   if (data.firstName !== undefined) createData.firstName = data.firstName;
   if (data.lastName !== undefined) createData.lastName = data.lastName;
   if (data.phone !== undefined) createData.phone = data.phone;
+  if (data.address !== undefined) createData.address = data.address;
+  if (data.department !== undefined) createData.department = data.department;
+  if (data.designation !== undefined) createData.designation = data.designation;
+  if (data.employeeType !== undefined) createData.employeeType = data.employeeType;
+  if (data.isActive !== undefined) createData.isActive = data.isActive;
   if (data.contractType !== undefined) createData.contractType = data.contractType;
   if (data.workloadPercent !== undefined) createData.workloadPercent = data.workloadPercent;
   if (data.hourlyRate !== undefined) createData.hourlyRate = data.hourlyRate;
@@ -35,29 +93,23 @@ const createUser = async (data: CreateUserInput) => {
   if (data.contractedHoursMonthly !== undefined) createData.contractedHoursMonthly = data.contractedHoursMonthly;
   if (data.hireDate !== undefined) createData.hireDate = new Date(data.hireDate);
 
+  // Category (role) assignments
+  if (data.categoryIds && data.categoryIds.length > 0) {
+    await assertCategoriesExist(data.categoryIds);
+    createData.categories = {
+      create: [...new Set(data.categoryIds)].map((categoryId) => ({
+        category: { connect: { id: categoryId } },
+      })),
+    };
+  }
+
   // 4. Create user
   const user = await prisma.user.create({
     data: createData,
-    select: {
-      id: true,
-      email: true,
-      firstName: true,
-      lastName: true,
-      phone: true,
-      contractType: true,
-      workloadPercent: true,
-      hourlyRate: true,
-      monthlySalary: true,
-      contractedHoursMonthly: true,
-      hireDate: true,
-      isActive: true,
-      mustChangePassword: true,
-      createdAt: true,
-      updatedAt: true,
-    },
+    select: userSelect,
   });
 
-  return user;
+  return flattenUser(user);
 };
 
 // ─── Update User ─────────────────────────────────────────────────
@@ -82,9 +134,14 @@ const updateUser = async (userId: string, data: UpdateUserInput) => {
   const updateData: Prisma.UserUpdateInput = {};
 
   if (data.email !== undefined) updateData.email = data.email;
+  if (data.name !== undefined) updateData.name = data.name;
   if (data.firstName !== undefined) updateData.firstName = data.firstName;
   if (data.lastName !== undefined) updateData.lastName = data.lastName;
   if (data.phone !== undefined) updateData.phone = data.phone;
+  if (data.address !== undefined) updateData.address = data.address;
+  if (data.department !== undefined) updateData.department = data.department;
+  if (data.designation !== undefined) updateData.designation = data.designation;
+  if (data.employeeType !== undefined) updateData.employeeType = data.employeeType;
   if (data.contractType !== undefined) updateData.contractType = data.contractType;
   if (data.workloadPercent !== undefined) updateData.workloadPercent = data.workloadPercent;
   if (data.hourlyRate !== undefined) updateData.hourlyRate = data.hourlyRate;
@@ -92,6 +149,23 @@ const updateUser = async (userId: string, data: UpdateUserInput) => {
   if (data.contractedHoursMonthly !== undefined) updateData.contractedHoursMonthly = data.contractedHoursMonthly;
   if (data.hireDate !== undefined) updateData.hireDate = new Date(data.hireDate);
   if (data.mustChangePassword !== undefined) updateData.mustChangePassword = data.mustChangePassword;
+
+  // Status toggle (Active / Inactive). Keep deactivatedAt consistent.
+  if (data.isActive !== undefined) {
+    updateData.isActive = data.isActive;
+    updateData.deactivatedAt = data.isActive ? null : new Date();
+  }
+
+  // Category (role) assignments — a provided list fully replaces the old set.
+  if (data.categoryIds !== undefined) {
+    await assertCategoriesExist(data.categoryIds);
+    updateData.categories = {
+      deleteMany: {},
+      create: [...new Set(data.categoryIds)].map((categoryId) => ({
+        category: { connect: { id: categoryId } },
+      })),
+    };
+  }
 
   // 4. If password is being updated, hash it
   if (data.password) {
@@ -101,26 +175,10 @@ const updateUser = async (userId: string, data: UpdateUserInput) => {
   const user = await prisma.user.update({
     where: { id: userId },
     data: updateData,
-    select: {
-      id: true,
-      email: true,
-      firstName: true,
-      lastName: true,
-      phone: true,
-      contractType: true,
-      workloadPercent: true,
-      hourlyRate: true,
-      monthlySalary: true,
-      contractedHoursMonthly: true,
-      hireDate: true,
-      isActive: true,
-      mustChangePassword: true,
-      createdAt: true,
-      updatedAt: true,
-    },
+    select: userSelect,
   });
 
-  return user;
+  return flattenUser(user);
 };
 
 // ─── Delete User ─────────────────────────────────────────────────
@@ -204,8 +262,9 @@ const getAllUsers = async (query: {
   limit: number;
   isActive?: boolean;
   search?: string;
+  categoryId?: string;
 }) => {
-  const { page, limit, isActive, search } = query;
+  const { page, limit, isActive, search, categoryId } = query;
   const skip = (page - 1) * limit;
 
   const where: Prisma.UserWhereInput = {};
@@ -214,15 +273,27 @@ const getAllUsers = async (query: {
     where.isActive = isActive;
   }
 
+  if (categoryId) {
+    where.categories = { some: { categoryId } };
+  }
+
   if (search) {
     where.OR = [
       { email: { contains: search, mode: "insensitive" } },
+      { name: { contains: search, mode: "insensitive" } },
       { firstName: { contains: search, mode: "insensitive" } },
       { lastName: { contains: search, mode: "insensitive" } },
+      { department: { contains: search, mode: "insensitive" } },
+      { designation: { contains: search, mode: "insensitive" } },
     ];
   }
 
-  const [users, total] = await Promise.all([
+  // Active/inactive tallies power the "11 active · 1 inactive" header. They are
+  // computed over the same filters EXCEPT the isActive filter itself.
+  const countWhere: Prisma.UserWhereInput = { ...where };
+  delete countWhere.isActive;
+
+  const [users, total, activeCount, inactiveCount] = await Promise.all([
     prisma.user.findMany({
       where,
       skip,
@@ -231,21 +302,35 @@ const getAllUsers = async (query: {
       select: {
         id: true,
         email: true,
+        name: true,
         firstName: true,
         lastName: true,
         phone: true,
+        department: true,
+        designation: true,
+        employeeType: true,
         contractType: true,
+        workloadPercent: true,
+        hourlyRate: true,
+        monthlySalary: true,
         isActive: true,
         lastLoginAt: true,
         hireDate: true,
         createdAt: true,
+        categories: {
+          select: { category: { select: { id: true, name: true, parentId: true } } },
+          orderBy: { assignedAt: "asc" },
+        },
       },
     }),
     prisma.user.count({ where }),
+    prisma.user.count({ where: { ...countWhere, isActive: true } }),
+    prisma.user.count({ where: { ...countWhere, isActive: false } }),
   ]);
 
   return {
-    users,
+    users: users.map(flattenUser),
+    counts: { active: activeCount, inactive: inactiveCount },
     pagination: {
       page,
       limit,
@@ -259,32 +344,14 @@ const getAllUsers = async (query: {
 const getUserById = async (userId: string) => {
   const user = await prisma.user.findUnique({
     where: { id: userId },
-    select: {
-      id: true,
-      email: true,
-      firstName: true,
-      lastName: true,
-      phone: true,
-      contractType: true,
-      workloadPercent: true,
-      hourlyRate: true,
-      monthlySalary: true,
-      contractedHoursMonthly: true,
-      hireDate: true,
-      isActive: true,
-      mustChangePassword: true,
-      lastLoginAt: true,
-      deactivatedAt: true,
-      createdAt: true,
-      updatedAt: true,
-    },
+    select: userSelect,
   });
 
   if (!user) {
     throw new AppError("User not found.", 404);
   }
 
-  return user;
+  return flattenUser(user);
 };
 
 export const userManagementServices = {

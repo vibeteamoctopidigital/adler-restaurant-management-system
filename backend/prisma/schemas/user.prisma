@@ -6,9 +6,14 @@ model User {
   isActive           Boolean   @default(true)
   lastLoginAt        DateTime?
 
+  name                   String?
   firstName              String?
   lastName               String?
   phone                  String?
+  address                String?
+  department             String?
+  designation            String?
+  employeeType           EmployeeType?
   contractType           ContractType?
   workloadPercent        Decimal?      @db.Decimal(5, 2)
   hourlyRate             Decimal?      @db.Decimal(10, 2)
@@ -20,9 +25,12 @@ model User {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  categories         UserCategory[]
-  availabilityMonths AvailabilityMonth[]
-  shifts             Shift[]
+  categories          UserCategory[]
+  availabilityMonths  AvailabilityMonth[]
+  shifts              Shift[]
+  shiftOfferResponses ShiftOfferResponse[]
+  initiatedShiftSwaps ShiftSwapRequest[]   @relation("ShiftSwapInitiatorUser")
+  receivedShiftSwaps  ShiftSwapRequest[]   @relation("ShiftSwapRecipientUser")
 
   initiatedSwaps      SwapRequest[]        @relation("SwapInitiator")
   receivedSwaps       SwapRequest[]        @relation("SwapRecipient")

@@ -276,3 +276,97 @@ Added `swaps { pending }` (count of `PENDING` swaps) and `thisMonth { period, sc
 ### New Endpoint Count (this iteration)
 **6 new endpoints**: 3 admin swaps (list, approve, reject) + 3 staff swaps (create, list, cancel), plus the enriched `/admin/overview` payload.
 
+## 12. Admin Settings Page — Profile Management & Extended Org Settings
+
+Backs the **Settings** page (Profile · L-GAV rule values · Notifications). Lets an admin manage **their own account** and tune the org-wide rule/notification config.
+
+### Schema Changes (`prisma/schemas/`)
+- **`Admin.name`** (`String?`) added — a single display-name field to match the Settings "Name" input (alongside the existing `firstName`/`lastName`).
+- **`OrgSettings.breakRequiredAfterHours`** (`Decimal @default(5.50)`) added — the "Break required after (h)" field. Given a **DB default** so the additive `db push` succeeded against the existing settings row.
+- Regenerated the client + `db push` (additive).
+
+### Admin Profile Management (`/api/v1/auth/admin`)
+- `GET /auth/admin/profile` now also returns `name` (and `updatedAt`).
+- **`PATCH /auth/admin/profile`** (admin-guarded) — update own `name`/`firstName`/`lastName`, `email`, and password. Validation (`updateAdminProfileSchema`):
+  - requires at least one field;
+  - a password change is **all-or-nothing** — `currentPassword` + `newPassword` (≥8) must be supplied together (else `400`);
+  - email changes are uniqueness-checked across admins (`409`).
+  - Service verifies `currentPassword` against the stored hash (`401` if wrong) before re-hashing the new one. On a successful password change it **revokes all of the admin's refresh tokens** and the controller **clears the session cookies**, so other sessions die and the admin re-authenticates. Response carries `passwordChanged` and an appropriate message.
+
+### Extended Org Settings (`/api/v1/admin/settings`)
+- `GET`/`PATCH /admin/settings` gained **`breakRequiredAfterHours`** (0–24) and a structured **`notificationPrefs`** object.
+- `notificationPrefs` toggles: `shiftPublished`, `swapRequests`, `availabilityReminders`, `ruleViolations`, `channelEmail`, `channelPush`, `channelInApp`. Stored in the existing `OrgSettings.notificationPrefs` JSON column.
+- `GET` always returns a **complete** prefs object (service-level `DEFAULT_NOTIFICATION_PREFS` merged over whatever is persisted). `PATCH` **merges** a partial prefs object over the current values, so the client only sends the toggles that change.
+
+### Verification
+- `npx tsc --noEmit` passes with **0 errors**.
+- E2E against the live server + DB, all confirmed: `GET /auth/admin/profile` returns `name` → `PATCH` name + email updates them (`passwordChanged:false`) → wrong `currentPassword` → `401` → `newPassword` without `currentPassword` → `400` → correct password change returns the re-login message, **old password stops working (401)** and the **new one logs in**; email/password reverted to the seed values afterward. Settings: `GET` returns `breakRequiredAfterHours` + full `notificationPrefs`; `PATCH` updates L-GAV values and a **partial** prefs object merges correctly (`swapRequests→false`, `channelEmail→true`, other toggles preserved); out-of-range `breakRequiredAfterHours` → `400`.
+
+### New Endpoint Count (this iteration)
+**1 new endpoint** (`PATCH /auth/admin/profile`), plus extended `GET /auth/admin/profile` and `GET`/`PATCH /admin/settings` payloads. **Total project endpoints: 50.**
+
+## 13. Codebase Restructure (feature-folder architecture) + Full Re-verification
+
+Reorganized the whole `src/modules` tree from **flat, prefix-named files** into **one folder per feature**, each self-contained with its `route` / `controller` / `service` / `validation`. No endpoint URLs or behaviour changed — this is a pure structural + import refactor, verified by a full endpoint sweep.
+
+### Before → after
+```
+BEFORE  src/modules/admin/shift.controller.ts        (flat, ~30 files in two folders)
+        src/modules/admin/shift.service.ts
+        src/modules/user/swap.controller.ts  …
+
+AFTER   src/modules/admin/shifts/shifts.controller.ts   (feature folders)
+        src/modules/admin/shifts/shifts.service.ts
+        src/modules/user/swaps/swaps.controller.ts   …
+```
+Feature folders created:
+- **admin/**: `auth`, `overview`, `employees` (was `user-management`, still mounted at `/admin/users`), `categories`, `shifts`, `swaps`, `reports`, `settings`
+- **user/**: `auth`, `shifts`, `notifications`, `swaps`
+
+### What changed mechanically
+- All 47 module files were `git mv`-moved into their feature folder and renamed to `<feature>.<part>.ts` (e.g. `admin.controller.ts` → `auth/auth.controller.ts`, `user-management.*` → `employees/employees.*`).
+- **Imports fixed** (verified by `tsc`): outward paths went one level deeper (`../../config` → `../../../config`, etc.); intra-feature sibling imports were re-pointed to the new file names; the two cross-module imports were re-pathed — `overview.service` → `../reports/reports.service`, and admin `swaps.service` → `../../user/swaps/swaps.service` (it reuses the staff `swapSelect`).
+- `routes/index.route.ts` rewritten to import the 12 feature routers from their new paths (same mount URLs, now grouped/commented by area).
+
+### Verification (nothing broke)
+- `npx tsc --noEmit` → **0 errors** after the move.
+- Server boots clean; full automated endpoint sweep re-run: **90/92 assertions pass**. The 2 non-passing lines are deliberate *test-expectation* quirks, not API faults, and were individually re-confirmed as correct behaviour: a login with a <6-char password returns `400` (Zod validation) before it can reach the `401` credential check; and creating a user with an already-used email returns `409` (email uniqueness) before the `400` unknown-category check — both guards fire in the correct order. Test data cleaned up; DB left empty.
+
+### Quality notes
+- Each feature folder is now independently navigable and testable; the `route → controller → service (+ validation)` layering is consistent across all 12 features.
+- `API_Doc.md` was expanded: every endpoint heading now shows its **full URL** (`http://localhost:8000/api/v1/...`), plus a cURL quick-start and a **Project structure** map.
+- A companion fix from the previous step (`postinstall`/`predev` running `prisma generate`) ensures the generated client always matches the schema after this move too.
+
+### Endpoint count: unchanged — **50 endpoints**, all working.
+
+## 14. Full Audit, Re-verification & New **Availability** Feature
+
+Senior-engineer pass over the whole codebase + all prompts + the original briefing: regression-tested everything, then closed the clearest remaining gap — **employee availability collection** (briefing outcomes 1 & 2, and the Overview "Availability submitted / Not submitted yet · Nudge" tiles).
+
+### Regression (nothing regressed after the restructure)
+Re-ran the full automated sweep of the existing 50 endpoints: **90/92 assertions pass**; the 2 non-passing lines are the known intentional test-expectation quirks (short-password login → `400` before `401`; duplicate-email create → `409` before the `400` category check), both correct behaviour.
+
+### New: Availability (uses the pre-existing `AvailabilityMonth` / `AvailabilityDay` models — no schema change)
+The admin **opens** a month with a cut-off; each active employee gets a slot; staff fill days (AVAILABLE / UNAVAILABLE / WISH, with optional note + preferred times) and **submit bindingly** before the cut-off; the admin watches submission status and nudges stragglers.
+
+**Admin module** (`src/modules/admin/availability/`, `/api/v1/admin/availability`):
+- `POST /open` — `{ year, month, cutoffAt }` upserts a slot for every active employee (new → `DRAFT`, existing → keeps filled days, updates cut-off).
+- `GET /?year=&month=` — per-employee status (`SUBMITTED`/`DRAFT`/`LOCKED`/`NOT_OPENED`), `filledDays`, a `notSubmitted` list, and a `summary`.
+- `GET /:userId?year=&month=` — one employee's month with full `days[]`.
+- `POST /:userId/nudge` — `{ year, month }` sends an `AVAILABILITY_REMINDER` notification; `409` if not open or already submitted.
+
+**Staff module** (`src/modules/user/availability/`, `/api/v1/availability`):
+- `GET /:year/:month` — my slot + days (`404` if not opened).
+- `PUT /:year/:month/days` — full-replace my entries; validates each date is **within the month**, rejects duplicate dates, and only while `DRAFT` + before cut-off.
+- `POST /:year/:month/submit` — `DRAFT → SUBMITTED` (+`submittedAt`); read-only afterwards.
+
+**Overview integration:** added an `availability` block for the most-recently-opened month — `{ year, month, submitted, total, notSubmitted[] }` — powering the dashboard availability tile + nudge list (`null` when no month is open).
+
+### Verification (all green)
+`tsc --noEmit` → 0 errors. Full E2E of the availability flow, all confirmed: open Dec 2026 (2 slots) → status shows both `DRAFT` → staff GET own draft → **unopened month → 404** → save mixed days (AVAILABLE/WISH+note+times/UNAVAILABLE) → **date-outside-month → 400** → submit → status flips to `SUBMITTED` with `submittedAt` → **edit-after-submit → 409** → admin status now `submitted:1, notSubmitted:[Luca]` → admin views a user's days → **nudge Luca → notification received**; **nudge already-submitted Anna → 409** → **Overview** availability tile shows `1/2` + `[Luca]` → **cut-off passed → 409** → **admin hitting a staff route → 403** → **submit with no days → 400**. Test data cleaned up; DB left empty.
+
+### Still deferred (documented, not silently dropped)
+The **weekly-plan auto-scheduling engine** ("Manage Plans" — turn demand + the now-collected availability into a rule-compliant proposed roster, with hand-adjustment + per-change L-GAV feedback) remains the one large piece; it needs a constraint/roster-generation layer and the legacy `WeeklyPlan` models. Also open but non-blocking: "open to the whole team" swaps (today's swaps are targeted) and real clock-in/out worked-hours capture (reports derive hours from approved shifts). These are the recommended next builds.
+
+### Endpoint count: **57** (added 4 admin + 3 staff availability), all working.
+

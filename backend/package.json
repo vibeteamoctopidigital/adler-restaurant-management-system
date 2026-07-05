@@ -4,9 +4,12 @@
   "description": "",
   "type": "module",
   "scripts": {
+    "postinstall": "prisma generate",
+    "predev": "prisma generate",
     "dev": "npx tsx watch src/server.ts",
     "build": "prisma generate && prisma migrate deploy && tsup",
     "migrate": "prisma generate && prisma db push",
+    "prisma:generate": "prisma generate",
     "start": "node dist/server.js",
     "lint": "eslint . --ext .ts",
     "stripe:webhook": "stripe listen --forward-to localhost:5000/api/v1/stripe/webhook"

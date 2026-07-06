@@ -561,3 +561,28 @@ Adapted the Express app to deploy on **Vercel serverless functions** without cha
 ### Endpoint Count
 Unchanged — **76 endpoints**. Deployment plumbing only; no API surface change.
 
+## User Side Doc
+
+Start of the **staff (employee) side**, which will be a **React Native** cross-platform mobile app. This iteration delivers the **authentication feature**: an admin-created user logs in with their email + default password, can **edit their own email and password**, and can log out. Built to be mobile-friendly (token-based, not cookie-dependent). Reference in `API_Doc.md` → **User Side Doc**.
+
+### Mobile-friendly auth (the key change)
+The existing user auth was **cookie-only**, which doesn't fit a React Native client. Made it token-first without breaking the admin web (cookie) flow:
+- **`middleware/auth.ts`** — `authenticate` now accepts **`Authorization: Bearer <token>`** *or* the `accessToken` cookie (Bearer takes priority). So the mobile app sends the token in a header; the admin web keeps using cookies. One additive change, both clients supported.
+- **Login & refresh now return the tokens in the response body** (`data.accessToken` + `data.refreshToken`) in addition to setting cookies, so the app can store them (SecureStore/Keychain). Refresh tokens are still rotated + hashed at rest.
+- **Refresh & logout accept the refresh token from the request body** (`{ refreshToken }`) as well as the cookie.
+
+### New: edit own email / password (`PATCH /api/v1/auth/user/profile`)
+- `user/auth/auth.validation.ts` — `updateUserProfileSchema`: optional `email`, `currentPassword`, `newPassword`; requires at least one field, and a password change requires `currentPassword`.
+- `user/auth/auth.service.ts` — `updateUserProfile`: email change is uniqueness-checked (`409`); a password change verifies `currentPassword` (`401` if wrong), re-hashes with bcrypt, **clears `mustChangePassword`** (covers the forced first-login change) and **revokes all refresh tokens** (kills every session). Returns the safe user projection + `passwordChanged`.
+- `user/auth/auth.controller.ts` — `updateProfile`; on a password change it also clears this session's cookies. Message tells the app to re-login when the password changed.
+- `user/auth/auth.route.ts` — `PATCH /profile` (guarded by `authenticate` + **`authorizeUser`**). Also tightened `GET /profile` with `authorizeUser` so admin tokens can't read a staff profile.
+
+Full user-side auth surface now: `POST /login`, `POST /refresh`, `GET /profile`, **`PATCH /profile`** (new), `POST /logout` — all under `/api/v1/auth/user`.
+
+### Verification
+- `npx tsc --noEmit` → **0 errors** (strict mode). One `exactOptionalPropertyTypes` fix on the service param type.
+- **Full E2E via the real HTTP routes (supertest + live DB)** — all green: login returns tokens in the body with `mustChangePassword:true`; **Bearer** `GET /profile` works and a no-token request is `401`; **edit email** works; **edit password** returns `passwordChanged:true`, clears `mustChangePassword`, and **revokes the old refresh token** (old refresh → `401`); wrong `currentPassword` → `401`; `newPassword` without `currentPassword` → `400`; empty body → `400`; re-login with the new email + password works; refresh returns a rotated pair; logout (Bearer + body token) → `200` and the refresh token no longer works. Test data cleaned up.
+
+### New Endpoint Count (this iteration)
+**1 new endpoint** (`PATCH /auth/user/profile`), plus mobile-friendly upgrades (Bearer auth, tokens-in-body) to the existing user login/refresh/logout. **Total project endpoints: 77.**
+

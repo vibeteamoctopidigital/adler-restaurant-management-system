@@ -89,6 +89,74 @@ const getUserProfile = async (userId: string) => {
   return user;
 };
 
+// ─── Update Own Profile (email / password) ───────────────────────
+const updateUserProfile = async (
+  userId: string,
+  data: {
+    email?: string | undefined;
+    currentPassword?: string | undefined;
+    newPassword?: string | undefined;
+  }
+) => {
+  const user = await prisma.user.findUnique({ where: { id: userId } });
+  if (!user) {
+    throw new AppError("User not found.", 404);
+  }
+
+  const updateData: {
+    email?: string;
+    passwordHash?: string;
+    mustChangePassword?: boolean;
+  } = {};
+
+  // Email change — enforce uniqueness across users.
+  if (data.email !== undefined && data.email !== user.email) {
+    const taken = await prisma.user.findUnique({ where: { email: data.email } });
+    if (taken) {
+      throw new AppError("A user with this email already exists.", 409);
+    }
+    updateData.email = data.email;
+  }
+
+  // Password change — verify the current password first.
+  let passwordChanged = false;
+  if (data.newPassword) {
+    const ok = await verifyPassword(data.currentPassword as string, user.passwordHash);
+    if (!ok) {
+      throw new AppError("Current password is incorrect.", 401);
+    }
+    updateData.passwordHash = await hashPassword(data.newPassword);
+    // Clears the forced-change flag set on admin-created accounts.
+    updateData.mustChangePassword = false;
+    passwordChanged = true;
+  }
+
+  const updated = await prisma.user.update({
+    where: { id: userId },
+    data: updateData,
+    select: {
+      id: true,
+      email: true,
+      firstName: true,
+      lastName: true,
+      mustChangePassword: true,
+      isActive: true,
+      updatedAt: true,
+    },
+  });
+
+  // On a password change, revoke every refresh token so other sessions can no
+  // longer be renewed (they die when their access token expires).
+  if (passwordChanged) {
+    await prisma.userRefreshToken.updateMany({
+      where: { userId, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+  }
+
+  return { user: updated, passwordChanged };
+};
+
 // ─── Refresh Token ───────────────────────────────────────────────
 const refreshUserToken = async (oldRefreshToken: string) => {
   // 1. Verify the token
@@ -185,6 +253,7 @@ const logoutUser = async (refreshToken: string) => {
 export const userServices = {
   loginUser,
   getUserProfile,
+  updateUserProfile,
   refreshUserToken,
   logoutUser,
 };

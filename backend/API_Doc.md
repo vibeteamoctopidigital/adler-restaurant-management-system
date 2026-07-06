@@ -163,6 +163,7 @@ Each file's role: **`*.route.ts`** wires paths + guards + validation → **`*.co
 17. [Staff — Availability](#17-staff--availability)
 18. [Enum Reference](#18-enum-reference)
 19. [Seed Script](#19-seed-script)
+- 📱 [User Side Doc](#user-side-doc) — staff / React Native mobile API
 
 ---
 
@@ -224,6 +225,8 @@ When `passwordChanged` is `true` the message is *"Profile updated. Please log in
 ## 2. Authentication — Staff (User)
 
 Staff accounts are **created by an admin** (§4). There is no self-signup; staff log in with the email + password the admin set.
+
+> 📱 **The staff/mobile (React Native) auth flow — Bearer tokens, tokens-in-body, and the edit-email/password endpoint — is documented in full under [User Side Doc](#user-side-doc).**
 
 ### `POST http://localhost:8000/api/v1/auth/user/login`  · public
 Body: `{ "email": "anna@adler.ch", "password": "Pass@123" }`
@@ -951,12 +954,91 @@ Credentials: **`admin@adler.com`** / **`Admin@123456`** (change after first logi
 
 ---
 
+## User Side Doc
+
+The staff-facing API for the **React Native mobile app**. The staff app is used by non-technical employees, mostly on their phones. These endpoints live under `/api/v1`, require the **`USER`** role, and are built for a token-storing mobile client.
+
+### Authentication model (mobile)
+Unlike the admin web app (which relies on HttpOnly cookies), the mobile app **stores the tokens itself**:
+
+- **Login and refresh return the tokens in the response body** (`data.accessToken`, `data.refreshToken`). Store them securely (e.g. Expo SecureStore / Keychain).
+- Send the access token on every request:
+  ```
+  Authorization: Bearer <accessToken>
+  ```
+  (Cookies are also set for browser clients, but the app should use the Bearer header.)
+- Access token lives ~15 min. On a `401`, call **refresh** with the stored refresh token to get a new pair (the refresh token is **rotated** — replace both), then retry the request.
+- These endpoints are `USER`-scoped and reject admin tokens with `403`.
+
+### `POST http://localhost:8000/api/v1/auth/user/login`  · public
+```json
+{ "email": "anna@adler.ch", "password": "Pass@123" }
+```
+`200`:
+```json
+{ "success": true, "message": "User logged in successfully.",
+  "data": {
+    "user": { "id": "…", "email": "anna@adler.ch", "firstName": null, "lastName": null, "mustChangePassword": true },
+    "accessToken": "eyJhbGciOi…", "refreshToken": "eyJhbGciOi…" } }
+```
+- `mustChangePassword: true` on a fresh admin-created account — the app should route the user straight to a **change-password** screen (see the `PATCH` below) before anything else.
+- Errors: `400` invalid body · `401` wrong credentials · `403` deactivated account · `429` too many attempts (rate limited).
+
+### `POST http://localhost:8000/api/v1/auth/user/refresh`  · public
+Body (mobile): `{ "refreshToken": "<stored refresh token>" }` — or the `refreshToken` cookie (browser).
+`200` → new, rotated pair (replace the stored tokens):
+```json
+{ "success": true, "message": "Tokens refreshed successfully.",
+  "data": { "accessToken": "eyJ…", "refreshToken": "eyJ…" } }
+```
+`401` if the token is missing / expired / already revoked.
+
+### `GET http://localhost:8000/api/v1/auth/user/profile`  · user (Bearer)
+The caller's own profile — contact details + **read-only** contract info (no password hash):
+```json
+{ "success": true, "data": { "user": {
+    "id": "…", "email": "anna@adler.ch", "firstName": "…", "lastName": "…", "phone": "…",
+    "contractType": "MONTHLY_SALARY", "workloadPercent": "100", "hourlyRate": "28",
+    "monthlySalary": "4600", "contractedHoursMonthly": "168", "hireDate": "…",
+    "isActive": true, "mustChangePassword": false, "lastLoginAt": "…", "createdAt": "…", "updatedAt": "…" } } }
+```
+
+### `PATCH http://localhost:8000/api/v1/auth/user/profile`  · user (Bearer) — **edit email / password**
+Change your own **email** and/or **password**. Provide at least one field.
+```json
+{ "email": "new@adler.ch", "currentPassword": "Pass@123", "newPassword": "NewPass1" }
+```
+| Field | Rules |
+|-------|-------|
+| `email` | valid email, unique across users (`409` if taken) |
+| `currentPassword` | required **only** when changing the password |
+| `newPassword` | min 6 chars; **requires** `currentPassword` |
+
+- A password change verifies `currentPassword` (`401` if wrong), **clears `mustChangePassword`**, and **revokes every refresh token** (all sessions, including the current one). The response has `passwordChanged: true` and the app must send the user back to **login** with the new password.
+- This is also the **forced first-login change**: log in with the default password, then `PATCH` with `currentPassword` = default password + a `newPassword`.
+- `400` if no field is given, or `newPassword` without `currentPassword`.
+
+`200`:
+```json
+{ "success": true, "message": "Profile updated successfully.",
+  "data": { "user": { "id": "…", "email": "new@adler.ch", "firstName": "…", "lastName": "…",
+    "mustChangePassword": false, "isActive": true, "updatedAt": "…" }, "passwordChanged": false } }
+```
+When `passwordChanged` is `true`, the message is *"Profile updated. Please log in again with your new password."*
+
+### `POST http://localhost:8000/api/v1/auth/user/logout`  · user (Bearer)
+Body (mobile): `{ "refreshToken": "<stored refresh token>" }` — or the cookie. Revokes that refresh token (and clears cookies). The app should also delete its stored tokens. `200`.
+
+> **Other staff endpoints** — view/accept shifts (§14), notifications (§15), swaps (§16), availability (§17) — are all `USER`-scoped and accept the same `Authorization: Bearer <token>` header. Refer to those sections for their payloads.
+
+---
+
 ## Endpoint Summary
 
 | Area | Endpoints |
 |------|-----------|
 | Auth — Admin | 5 |
-| Auth — Staff | 4 |
+| Auth — Staff | 5 |
 | Admin — Overview | 1 |
 | Admin — Employees | 7 |
 | Admin — Categories | 7 |
@@ -972,6 +1054,6 @@ Credentials: **`admin@adler.com`** / **`Admin@123456`** (change after first logi
 | Staff — Notifications | 3 |
 | Staff — Shift Swaps | 3 |
 | Staff — Availability | 3 |
-| **Total** | **76** |
+| **Total** | **77** |
 
 > **Not yet implemented (deferred scheduling engine):** the weekly-plan **auto-generation** ("Manage Plans") — automatically turning demand + submitted availability into a rule-compliant proposed roster, with hand-adjustment and per-change L-GAV feedback. The demand side is now built two ways — the day-level **Demands** grid (§10, `DemandWeek` / `DayDemand`) and the shift-slot **Workload** layer (§9, `WeeklyPlan` / `StaffingDemand`) — and employee **availability collection** too (§13 & §17); what remains is only the constraint-solving/roster-generation engine that consumes them. Also open (not blocking): "open to the whole team" swaps (current swaps are targeted) and actual clock-in/out worked-hours capture (reports currently derive hours from approved shifts). Tracked in `implimated.md`.

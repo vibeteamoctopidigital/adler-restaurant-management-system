@@ -8,7 +8,13 @@ import { sendError } from "../utils/apiResponse";
  * On success, attaches { userId, email, role } to res.locals.auth.
  */
 export const authenticate = (req: Request, res: Response, next: NextFunction): void => {
-  const token = req.cookies?.accessToken;
+  // Accept a Bearer token (mobile / React Native clients that store tokens
+  // themselves) or the accessToken cookie (browser clients like the admin web).
+  const authHeader = req.headers.authorization;
+  const token =
+    authHeader && authHeader.startsWith("Bearer ")
+      ? authHeader.slice("Bearer ".length).trim()
+      : req.cookies?.accessToken;
 
   if (!token) {
     sendError(res, {

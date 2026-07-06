@@ -53,6 +53,7 @@ async function main() {
     // Check if user exists
     let user = await prisma.user.findUnique({ where: { email } });
     if (!user) {
+      const contractType = faker.helpers.arrayElement([ContractType.HOURLY, ContractType.MONTHLY_SALARY, ContractType.WORKLOAD_PERCENT]);
       user = await prisma.user.create({
         data: {
           email,
@@ -65,8 +66,10 @@ async function main() {
           department: faker.helpers.arrayElement(['Kitchen', 'Front of House', 'Bar', 'Management']),
           designation: faker.person.jobTitle(),
           employeeType: faker.helpers.arrayElement([EmployeeType.FULL_TIME, EmployeeType.PART_TIME]),
-          contractType: faker.helpers.arrayElement([ContractType.HOURLY, ContractType.MONTHLY_SALARY, ContractType.WORKLOAD_PERCENT]),
+          contractType,
           hourlyRate: faker.number.int({ min: 15, max: 35 }),
+          monthlySalary: contractType === ContractType.MONTHLY_SALARY ? faker.number.int({ min: 3000, max: 6000 }) : null,
+          contractedHoursMonthly: contractType !== ContractType.HOURLY ? faker.number.int({ min: 80, max: 160 }) : null,
           isActive: true,
           mustChangePassword: false,
         },
@@ -144,6 +147,14 @@ async function main() {
       const randomUser = faker.helpers.arrayElement(users);
       const randomCategory = faker.helpers.arrayElement(categories);
 
+      const isPublished = planData.status === PlanStatus.PUBLISHED;
+      const actualStart = isPublished ? new Date(startTime.getTime()) : null;
+      const actualEnd = isPublished ? new Date(endTime.getTime()) : null;
+      if (isPublished) {
+        // randomly add some overtime (0 to 2 hours)
+        actualEnd!.setHours(actualEnd!.getHours() + faker.number.int({ min: 0, max: 2 }));
+      }
+
       await prisma.shift.create({
         data: {
           weeklyPlanId: plan.id,
@@ -152,7 +163,10 @@ async function main() {
           date: shiftDate,
           startTime,
           endTime,
-          status: planData.status === PlanStatus.PUBLISHED ? ShiftStatus.ACCEPTED : ShiftStatus.PENDING,
+          actualStartTime: actualStart,
+          actualEndTime: actualEnd,
+          actualBreakMinutes: isPublished ? 30 : null,
+          status: isPublished ? ShiftStatus.ACCEPTED : ShiftStatus.PENDING,
         },
       });
     }

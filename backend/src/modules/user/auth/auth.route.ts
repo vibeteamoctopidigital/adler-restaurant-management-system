@@ -1,9 +1,9 @@
 import { Router } from "express";
 import { asyncHandler } from "../../../utils/asyncHandler";
 import { validateRequest } from "../../../middleware/validateRequest";
-import { authenticate } from "../../../middleware/auth";
+import { authenticate, authorizeUser } from "../../../middleware/auth";
 import { authLimiter } from "../../../middleware/rateLimit";
-import { userLoginSchema } from "./auth.validation";
+import { userLoginSchema, updateUserProfileSchema } from "./auth.validation";
 import * as userController from "./auth.controller";
 
 const userAuthRouter = Router();
@@ -14,6 +14,13 @@ userAuthRouter.post("/refresh", authLimiter, asyncHandler(userController.refresh
 
 // Protected routes
 userAuthRouter.post("/logout", authenticate, asyncHandler(userController.logout));
-userAuthRouter.get("/profile", authenticate, asyncHandler(userController.getProfile));
+userAuthRouter.get("/profile", authenticate, authorizeUser, asyncHandler(userController.getProfile));
+userAuthRouter.patch(
+  "/profile",
+  authenticate,
+  authorizeUser,
+  validateRequest(updateUserProfileSchema),
+  asyncHandler(userController.updateProfile)
+);
 
 export default userAuthRouter;

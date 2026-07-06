@@ -1,5 +1,5 @@
-import express, { type Express } from "express";
-import { envConfig } from "./config/env";
+import express, { type Express, type Request, type Response } from "express";
+import { envConfig, envValidationError } from "./config/env";
 import { logger } from "./utils/logger";
 import { applyMiddleware } from "./middleware";
 import { errorHandler } from "./middleware/errorHandler";
@@ -13,6 +13,19 @@ const app: Express = express();
 app.set("trust proxy", envConfig.TRUST_PROXY_HOPS);
 
 applyMiddleware(app);
+
+// If the environment is misconfigured, refuse every request with a clear,
+// readable error instead of serving with placeholder secrets.
+if (envValidationError) {
+  app.use((_req: Request, res: Response) => {
+    res.status(500).json({
+      success: false,
+      message: "Server misconfigured: invalid or missing environment variables.",
+      error: envValidationError,
+    });
+  });
+}
+
 app.use("/api/v1",indexRouter)
 
 

@@ -14,8 +14,14 @@ export const errorHandler = (err: any, req: Request, res: Response, _next: NextF
     statusCode = err.statusCode;
     message = err.message;
   }
-  // Handle Prisma specific database errors
-  else if (err?.constructor?.name?.startsWith('Prisma')) {
+  // Handle database errors — Prisma's own error classes AND the driver-adapter
+  // (pg) errors that surface raw constraint violations. `handlePrismaError`
+  // maps both to a safe status + message so they never leak as a raw 500.
+  else if (
+    err?.constructor?.name?.startsWith('Prisma') ||
+    err?.constructor?.name === 'DriverAdapterError' ||
+    (typeof err?.code === 'string' && /^P\d{4}$/.test(err.code))
+  ) {
     const prismaError = handlePrismaError(err);
     statusCode = prismaError.statusCode;
     message = prismaError.message;

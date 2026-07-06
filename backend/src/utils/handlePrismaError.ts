@@ -14,7 +14,8 @@ export const handlePrismaError = (error: any) => {
                 break;
                 
             case 'P2003': // Foreign key constraint
-                message = "Integrity error: You are trying to reference or delete a record that is linked to other data.";
+                statusCode = 409;
+                message = "This record is linked to other data and cannot be modified or deleted.";
                 break;
 
             case 'P2025': // Record not found
@@ -65,7 +66,24 @@ export const handlePrismaError = (error: any) => {
         message = "An unidentifiable database request error occurred.";
     }
 
-    return { 
+    // 6. DRIVER ADAPTER ERRORS — with driver adapters (pg), constraint
+    //    violations surface as raw driver errors rather than Prisma P-codes, so
+    //    detect the common ones by message and map them to friendly conflicts.
+    else if (typeof error?.message === "string") {
+        const msg = error.message.toLowerCase();
+        if (msg.includes("foreign key constraint")) {
+            statusCode = 409;
+            message = "This record is linked to other data and cannot be modified or deleted.";
+        } else if (msg.includes("unique constraint")) {
+            statusCode = 409;
+            message = "A record with these details already exists.";
+        } else if (msg.includes("not-null") || msg.includes("null value")) {
+            statusCode = 400;
+            message = "A required field is missing.";
+        }
+    }
+
+    return {
         statusCode, 
         message,
         // Optional: include original error in development for easier debugging

@@ -30,11 +30,13 @@ const envSchema = z.object({
 const parsed = envSchema.safeParse(process.env);
 
 if (!parsed.success) {
-  logger.fatal(
-    { fieldErrors: parsed.error.flatten().fieldErrors },
-    'Invalid or missing environment variables'
+  const fieldErrors = parsed.error.flatten().fieldErrors;
+  logger.fatal({ fieldErrors }, 'Invalid or missing environment variables');
+  // Throw (rather than process.exit) so serverless entrypoints can catch this
+  // and return a readable error instead of an opaque crash.
+  throw new Error(
+    'Invalid or missing environment variables: ' + JSON.stringify(fieldErrors)
   );
-  process.exit(1);
 }
 
 export const envConfig = parsed.data;

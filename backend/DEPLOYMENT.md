@@ -52,6 +52,32 @@ Push to the connected branch (or click **Deploy**). Vercel will:
 - `GET https://<your-deployment>/health` → `{ "status": "ok", ... }`
 - `GET https://<your-deployment>/api/v1/admin/overview` → `401` (auth required — proves routing + guards work).
 
+## Troubleshooting
+
+### `500: FUNCTION_INVOCATION_FAILED`
+The function crashed **during initialization**. The entry point now catches init
+failures and returns a readable JSON body instead of an opaque crash, so hit the
+URL again and read the `error` field, e.g.:
+```json
+{ "success": false, "message": "Backend failed to initialize.",
+  "error": "Invalid or missing environment variables: {\"JWT_SECRET\":[\"String must contain at least 32 character(s)\"]}" }
+```
+Also check **Deployments → [latest] → Runtime Logs** for the full stack.
+
+Most common causes:
+1. **Missing/invalid env var** — the `error` field names the field(s). Fix: add
+   it under Settings → Environment Variables for the **Production** environment
+   (secrets must be ≥ 32 chars; `DATABASE_URL` must be a valid URL). Re-deploy.
+2. **Wrong Root Directory** — must be `backend` (see Step 1).
+3. **Prisma engine** — if the error mentions the query engine, confirm the build
+   ran `prisma generate` (it's in `postinstall`) and that `vercel.json`'s
+   `includeFiles` is present.
+
+> **Region:** on the Hobby plan the function deploys to your account's default
+> region regardless of `regions` in `vercel.json`. For lowest DB latency, keep
+> the app and the Neon database in the same region (this app targets `iad1` /
+> Neon `us-east-1`).
+
 ## Notes & caveats
 
 - **Database:** always point `DATABASE_URL` at the **pooled** Neon endpoint for serverless. Run schema changes with `npm run migrate` (`prisma db push`) from your machine, **not** during the Vercel build.

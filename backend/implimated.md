@@ -536,7 +536,7 @@ Unchanged — **76 endpoints**. This is a cross-cutting security hardening, not 
 Adapted the Express app to deploy on **Vercel serverless functions** without changing any endpoint behaviour. Local dev is untouched (`npm run dev` still uses `src/server.ts` + `app.listen()`). Full deploy guide added in `DEPLOYMENT.md`.
 
 ### Serverless entry + routing
-- **`api/index.ts`** (new) — `import app from "../src/app"; export default app;`. An Express app *is* a `(req, res)` handler, which is exactly what Vercel invokes. No `listen()` runs on Vercel.
+- **`api/index.ts`** (new) — lazily (dynamic-import) loads the Express app and **wraps it so any initialization failure returns a readable JSON 500** (`{ message: "Backend failed to initialize.", error }`) instead of an opaque `FUNCTION_INVOCATION_FAILED`. An Express app *is* a `(req, res)` handler, which Vercel invokes directly. No `listen()` runs on Vercel. (`env.ts` now **throws** on invalid env instead of `process.exit`, so this wrapper can catch and surface it; `tsconfig` gained `"module": "ESNext"` for the dynamic import.)
 - **`vercel.json`** (new) — `@vercel/node` build of `api/index.ts` with a catch-all route (`/(.*) → api/index.ts`) that **preserves the original path**, so Express routing (`/api/v1/...`, `/health`) works unchanged. Region pinned to `iad1` (co-located with the Neon `us-east-1` DB).
 
 ### Prisma made serverless-safe

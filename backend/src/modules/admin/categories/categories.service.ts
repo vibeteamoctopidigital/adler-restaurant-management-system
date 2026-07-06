@@ -141,35 +141,35 @@ const updateCategory = async (categoryId: string, data: UpdateCategoryInput) => 
   });
 };
 
-// ─── Delete Category ─────────────────────────────────────────────
+// ─── Delete Category (force) ─────────────────────────────────────
+// An admin delete always removes the category. Everything tied to it — and to
+// its sub-categories — is removed with it in one transaction: day-level Demands,
+// Workload staffing demands, shift offers (their responses + swaps cascade),
+// roster shifts (their swaps cascade), and employee assignments. Sub-categories
+// are deleted too. All the FKs here are onDelete: Restrict, so we clear the
+// dependents explicitly rather than letting the DB reject the delete.
 const deleteCategory = async (categoryId: string) => {
   const existing = await prisma.category.findUnique({
     where: { id: categoryId },
-    select: {
-      id: true,
-      _count: { select: { shiftOffers: true, shifts: true, children: true } },
-    },
+    select: { id: true, children: { select: { id: true } } },
   });
   if (!existing) {
     throw new AppError("Category not found.", 404);
   }
 
-  // Block deletion while the category is referenced by real scheduling data —
-  // actual shifts (ShiftOffer / Shift) or sub-categories. These are onDelete:
-  // Restrict at the DB level and deleting would destroy real records.
-  if (existing._count.shiftOffers > 0 || existing._count.shifts > 0 || existing._count.children > 0) {
-    throw new AppError(
-      "This category is in use by shifts or sub-categories and cannot be deleted. Deactivate it instead.",
-      409
-    );
-  }
+  const childIds = existing.children.map((c) => c.id);
+  const allIds = [categoryId, ...childIds];
 
-  // Planning-only references (Workload staffing demands + day-level Demands) are
-  // also onDelete: Restrict, so remove them first, then delete the category — all
-  // in one transaction. (Employee assignments cascade automatically.)
   await prisma.$transaction([
-    prisma.dayDemand.deleteMany({ where: { categoryId } }),
-    prisma.staffingDemand.deleteMany({ where: { categoryId } }),
+    prisma.dayDemand.deleteMany({ where: { categoryId: { in: allIds } } }),
+    prisma.staffingDemand.deleteMany({ where: { categoryId: { in: allIds } } }),
+    prisma.shiftOffer.deleteMany({ where: { categoryId: { in: allIds } } }),
+    prisma.shift.deleteMany({ where: { categoryId: { in: allIds } } }),
+    prisma.userCategory.deleteMany({ where: { categoryId: { in: allIds } } }),
+    // Sub-categories reference the parent (Restrict), so remove them first.
+    ...(childIds.length
+      ? [prisma.category.deleteMany({ where: { id: { in: childIds } } })]
+      : []),
     prisma.category.delete({ where: { id: categoryId } }),
   ]);
 };

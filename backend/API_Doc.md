@@ -399,8 +399,8 @@ Query: `page`, `limit` (default 50), `isActive`, `search`. Each row includes `_c
 
 ### `GET http://localhost:8000/api/v1/admin/categories/:categoryId`  · get one · `404` if missing
 ### `PATCH http://localhost:8000/api/v1/admin/categories/:categoryId`  · body `{ "name"?, "isActive"? }` · `409` on duplicate sibling name
-### `DELETE http://localhost:8000/api/v1/admin/categories/:categoryId`
-`409` if the category is still referenced by shifts or has sub-categories ("in use — deactivate instead"); otherwise `200`.
+### `DELETE http://localhost:8000/api/v1/admin/categories/:categoryId`  · **force delete**
+Always deletes the category (`200`). Everything tied to it — and to its sub-categories — is removed in one transaction: day-level Demands, Workload staffing demands, shift offers (their responses + swaps cascade), roster shifts, and employee assignments; sub-categories are deleted too. `404` if not found. **This is destructive** — deactivate (`PATCH isActive:false`) instead if you only want to hide it.
 
 ---
 

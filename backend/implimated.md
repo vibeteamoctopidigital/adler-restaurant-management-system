@@ -441,3 +441,47 @@ Switched the admin **Employees** list (`GET /api/v1/admin/users`) from offset (`
 ### Endpoint Count
 Unchanged — **68 endpoints**. This is a behavioural upgrade to the existing `GET /admin/users`, not a new route. Its `meta.pagination` shape changed from offset to cursor (documented in `API_Doc.md` §4 + the Pagination conventions).
 
+## 17. Admin **Demands** — Weekly Per-Day, Per-Category Headcount Grid
+
+Implements the **Weekly demand** page: the admin plans **how many employees each category needs on each day**, one Sunday–Saturday week at a time, edits it as a category × day grid of steppers, and saves/publishes it. The current week shows first, upcoming weeks below, and a "Create week plan" modal can seed a new week from an existing one.
+
+> **Design note — new self-contained models, deliberately NOT the shift-slot `StaffingDemand`.** The nav now separates **Weekly Plan** (the deferred roster engine on `WeeklyPlan`) and **Demands** (this page). The Demands grid is **day-level** — one count per (week, category, day) with **no shift time slots** — and uses **Sunday-based** weeks (the UI columns run Sun→Sat), whereas the earlier Workload/`StaffingDemand` layer is **slot-level** and **Monday-based**. Overloading one model for both granularities/week-conventions would have been a bug farm, so Demands got its own clean models. Weeks (`WeeklyPlan`) are **not** reused for the same reason (different week convention + that model belongs to "Weekly Plan").
+
+### Schema Changes (`prisma/schemas/demand.prisma` — new file)
+- **New enum** `DemandWeekStatus { DRAFT, PUBLISHED }`.
+- **`DemandWeek`** — one row per week: `weekStartDate` (a Sunday, `@db.Date`, **`@@unique`** → one plan per week), `weekEndDate` (the Saturday), `status`, `publishedAt`.
+- **`DayDemand`** — one grid cell: `demandWeekId` (→ `DemandWeek`, cascade delete), `categoryId` (→ `Category`, restrict), `date` (`@db.Date`), `requiredCount` (`Int`, default 0). **`@@unique([demandWeekId, categoryId, date])`** guarantees exactly one count per category per day.
+- Added the `dayDemands DayDemand[]` back-relation on `Category`.
+- **`base.prisma`** — restored `url = env("DATABASE_URL")` on the datasource; the installed Prisma **6.19** CLI requires it in-schema to `generate`/`db push` (the `prisma.config.ts` injection alone doesn't resolve for the CLI). Regenerated the client and ran `prisma db push` against Neon — **additive** (2 new tables + 1 enum), non-destructive.
+
+### Admin Demands Module (`src/modules/admin/demands/`, `/api/v1/admin/demands`)
+Standard `validation → route → controller → service`, admin-guarded, Zod-validated.
+| File | Purpose |
+|------|---------|
+| `demands.validation.ts` | Zod schemas: list query (`scope` week/month/upcoming + optional `date`), create-week (`weekStartDate` + optional `copyFromWeekId`), save-grid (1–700 cells), single-cell upsert. `requiredCount` is int 0–1000; a shared `dateString` accepts date-only or ISO. |
+| `demands.service.ts` | All logic + Prisma. **Sunday-based week math** (`weekStartSunday` uses `getUTCDay`), grid builder (fills every active category × 7 days, 0 where no cell), copy-from-week day-for-day remap, cell validation (in-week dates + existing categories), and the operations below. |
+| `demands.controller.ts` | Thin HTTP controllers. |
+| `demands.route.ts` | 8 routes, all `authenticate` + `authorizeAdmin`. |
+
+**Endpoints:**
+- `GET /` — grid view by **scope**: `week` (the Sun–Sat week of `date`), `month` (all weeks whose Sunday is in that month), `upcoming` (default — **current week first, then all future weeks**). Response also carries `today` + computed `currentWeek` bounds so the UI can always show the current week.
+- `GET /weeks` — lightweight newest-first list (id, range, status, `demandCount`, `relative`) for the modal's "Start from week's data" dropdown.
+- `POST /weeks` — create a week; **snaps `weekStartDate` to that week's Sunday**; optional `copyFromWeekId` seeds cells remapped day-for-day. `409` on duplicate week, `404` on bad copy source.
+- `GET /weeks/:weekId` — one week's full grid.
+- `PUT /weeks/:weekId` — **Save** the whole grid: upserts every provided cell (unique per week+category+date); validates each date is one of the week's 7 days and each category exists (`400`).
+- `PUT /weeks/:weekId/cell` — single-cell upsert for the −/+ steppers.
+- `POST /weeks/:weekId/publish` — set `PUBLISHED` + `publishedAt`.
+- `DELETE /weeks/:weekId` — delete a week (cells cascade).
+
+Each returned week is a `{ id, weekStartDate, weekEndDate, status, publishedAt, relative, days[7], categories[] }` shape where `relative` is `current`/`upcoming`/`past` and every category row has 7 `{ date, requiredCount, demandId }` cells (0 / null when unsaved).
+
+### Route Wiring (`src/routes/index.route.ts`)
+Mounted `demandRouter` at `/admin/demands` (one import + one `use`).
+
+### Verification
+- `npx tsc --noEmit` → **0 errors** (strict mode). All 8 routes register (verified via router-stack introspection).
+- **Full E2E against the live DB — 25/25 checks pass**, including: `Jul 5 2026` confirmed a **Sunday** (`getUTCDay()===0`); a mid-week input (`Jul 8`) **snaps to Sunday `Jul 5`** with `weekEndDate` `Jul 11` and a 7-day grid; empty cells default to `0`/`null`; **duplicate week → 409**; save grid persists (Sun=12, Mon=13) and leaves untouched cells at 0; **out-of-week date → 400**; **unknown category → 400**; single-cell stepper upsert; **copy-from-week** carries each weekday's value into the new week (Sun 20→Jul 12, Mon 13→Jul 13); `scope=week`/`month`/`upcoming` return the right weeks; `listWeeks` newest-first with `demandCount`; **publish → PUBLISHED + publishedAt**; **delete cascades** its `DayDemand` rows; missing week → 404. All test data cleaned up afterwards.
+
+### New Endpoint Count (this iteration)
+**8 new admin endpoints**. **Total project endpoints: 76.**
+

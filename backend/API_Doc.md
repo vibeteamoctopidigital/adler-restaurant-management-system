@@ -139,15 +139,16 @@ Each file's role: **`*.route.ts`** wires paths + guards + validation → **`*.co
 7. [Admin — Shift Approvals](#7-admin--shift-approvals)
 8. [Admin — Shift Swaps](#8-admin--shift-swaps)
 9. [Admin — Workload](#9-admin--workload)
-10. [Admin — Reports](#10-admin--reports)
-11. [Admin — Settings](#11-admin--settings)
-12. [Admin — Availability](#12-admin--availability)
-13. [Staff — Shifts](#13-staff--shifts)
-14. [Staff — Notifications](#14-staff--notifications)
-15. [Staff — Shift Swaps](#15-staff--shift-swaps)
-16. [Staff — Availability](#16-staff--availability)
-17. [Enum Reference](#17-enum-reference)
-18. [Seed Script](#18-seed-script)
+10. [Admin — Demands](#10-admin--demands)
+11. [Admin — Reports](#11-admin--reports)
+12. [Admin — Settings](#12-admin--settings)
+13. [Admin — Availability](#13-admin--availability)
+14. [Staff — Shifts](#14-staff--shifts)
+15. [Staff — Notifications](#15-staff--notifications)
+16. [Staff — Shift Swaps](#16-staff--shift-swaps)
+17. [Staff — Availability](#17-staff--availability)
+18. [Enum Reference](#18-enum-reference)
+19. [Seed Script](#19-seed-script)
 
 ---
 
@@ -436,7 +437,7 @@ Sends an in-app notification to **every active employee** and stamps `notifiedAt
 ---
 
 ## 7. Admin — Shift Approvals
-The accept-then-confirm flow. Staff **accept** a published shift (§13); the admin then **approves** who actually works it. Only approved responses count as "available/confirmed workers".
+The accept-then-confirm flow. Staff **accept** a published shift (§14); the admin then **approves** who actually works it. Only approved responses count as "available/confirmed workers".
 
 ### `GET http://localhost:8000/api/v1/admin/shifts/approvals`  · feed
 Query: `page`, `limit`, `pendingOnly` (`true`/`false`). Returns published shifts that have volunteers.
@@ -478,7 +479,7 @@ Body (optional): `{ "note": "Enough coverage" }`. Sets `REJECTED`, notifies the 
 ---
 
 ## 8. Admin — Shift Swaps
-Employees request to swap their **confirmed** shifts (§15); the admin approves or rejects. Approval performs the exchange atomically.
+Employees request to swap their **confirmed** shifts (§16); the admin approves or rejects. Approval performs the exchange atomically.
 
 ### `GET http://localhost:8000/api/v1/admin/swaps`  · list
 Query: `page`, `limit`, `status` (`PENDING` \| `APPROVED` \| `REJECTED` \| `CANCELLED`). Each **pending** swap carries a lightweight L-GAV `ruleCheck`.
@@ -617,7 +618,89 @@ For `week` the window is the **Monday-based** week containing `date`; for `month
 
 ---
 
-## 10. Admin — Reports
+## 10. Admin — Demands
+Base path `/admin/demands`. The **Weekly demand** page is where the admin plans **how many employees each category needs on each day**, one **Sunday–Saturday** week at a time, then saves and publishes it. The current week shows first, upcoming weeks below — each an editable **category × day** grid.
+
+> **Model:** a `DemandWeek` (one row per Sunday) holds `DayDemand` cells — a required headcount per **(category, day)** (`@@unique([demandWeekId, categoryId, date])`). Grid **rows are the admin's active categories** (§5): every active category gets a row and each of the 7 days a cell (defaulting to `0`). This day-level grid is intentionally distinct from the shift-slot `StaffingDemand` / Workload (§9).
+
+### Week shape (returned by the grid endpoints)
+```json
+{ "id": "…", "weekStartDate": "2026-07-05", "weekEndDate": "2026-07-11",
+  "status": "DRAFT", "publishedAt": null, "relative": "current",
+  "days": ["2026-07-05","2026-07-06","2026-07-07","2026-07-08","2026-07-09","2026-07-10","2026-07-11"],
+  "categories": [
+    { "category": { "id": "…", "name": "Vegetables" },
+      "cells": [ { "date": "2026-07-05", "requiredCount": 12, "demandId": "…" },
+                 { "date": "2026-07-06", "requiredCount": 13, "demandId": "…" }, "… 5 more, one per day …" ] } ] }
+```
+`relative` is `current` / `upcoming` / `past` (vs. today's week). An unsaved cell returns `requiredCount: 0` and `demandId: null`.
+
+### `GET http://localhost:8000/api/v1/admin/demands`  · grid view (sortable)
+| Query | Rules |
+|-------|-------|
+| `scope` | `week` \| `month` \| `upcoming` (default `upcoming`) |
+| `date` | reference date (any day); defaults to today |
+
+- `week` → the single Sun–Sat week containing `date`.
+- `month` → every week whose Sunday falls in `date`'s calendar month.
+- `upcoming` (default) → the **current week first, then all future weeks**.
+```json
+{ "success": true, "data": {
+    "scope": "upcoming",
+    "today": "2026-07-06",
+    "currentWeek": { "weekStartDate": "2026-07-05", "weekEndDate": "2026-07-11" },
+    "weeks": [ { "… week shape …": "…" } ] } }
+```
+`currentWeek` is always returned (computed from today) so the UI can render/offer the current week even when no plan exists for it yet.
+
+### `GET http://localhost:8000/api/v1/admin/demands/weeks`  · list week plans (lightweight)
+Newest-first, no grid — powers the modal's "Start from week's data" dropdown.
+```json
+{ "success": true, "data": { "weeks": [
+    { "id": "…", "weekStartDate": "2026-07-12", "weekEndDate": "2026-07-18",
+      "status": "DRAFT", "publishedAt": null, "demandCount": 14, "relative": "upcoming" } ] } }
+```
+
+### `POST http://localhost:8000/api/v1/admin/demands/weeks`  · create a week plan
+```json
+{ "weekStartDate": "2026-07-19", "copyFromWeekId": "<existing weekId?>" }
+```
+| Field | Required | Rules |
+|-------|----------|-------|
+| `weekStartDate` | ✅ | any day in the target week — the server **snaps it to that week's Sunday** and sets `weekEndDate` to the Saturday |
+| `copyFromWeekId` | — | seed the new week from an existing one; each source cell is remapped **day-for-day** (same weekday) into the new week |
+
+`201` → `{ "data": { "week": { "… week shape (incl. any copied cells) …": "…" } } }`. `409` if a plan already exists for that week; `404` if `copyFromWeekId` doesn't exist.
+
+### `GET http://localhost:8000/api/v1/admin/demands/weeks/:weekId`  · one week (full grid) · `404` if missing
+
+### `PUT http://localhost:8000/api/v1/admin/demands/weeks/:weekId`  · save the whole grid
+The per-week **Save** button. Upserts every provided cell; cells you omit keep their current value.
+```json
+{ "demands": [
+  { "categoryId": "…", "date": "2026-07-05", "requiredCount": 12 },
+  { "categoryId": "…", "date": "2026-07-06", "requiredCount": 13 } ] }
+```
+| Field (per cell) | Rules |
+|------------------|-------|
+| `categoryId` | must exist (`400` otherwise) |
+| `date` | must be one of the week's 7 days (`400` if outside) |
+| `requiredCount` | int 0–1000 |
+
+1–700 cells per call. `200` → `{ "data": { "week": { "… updated grid …": "…" } } }`. `404` if the week is missing.
+
+### `PUT http://localhost:8000/api/v1/admin/demands/weeks/:weekId/cell`  · update a single cell (stepper)
+Backs the −/+ steppers. Body: `{ "categoryId": "…", "date": "2026-07-05", "requiredCount": 20 }` (same validation as above).
+`200` → `{ "data": { "demand": { "id": "…", "categoryId": "…", "date": "2026-07-05", "requiredCount": 20 } } }`
+
+### `POST http://localhost:8000/api/v1/admin/demands/weeks/:weekId/publish`  · publish
+Sets `status = PUBLISHED` and stamps `publishedAt`. `200` → `{ "data": { "week": { "…": "…", "status": "PUBLISHED" } } }`. `404` if missing.
+
+### `DELETE http://localhost:8000/api/v1/admin/demands/weeks/:weekId`  · `200` (cells cascade) · `404` if missing
+
+---
+
+## 11. Admin — Reports
 ### `GET http://localhost:8000/api/v1/admin/reports`  · per-employee hours & wage
 Query: `year` (2000–2100), `month` (1–12), `categoryId`. Defaults to the current month if omitted. Hours are derived from **admin-approved** shift acceptances that fall in the month.
 ```json
@@ -640,7 +723,7 @@ Same query. Responds with `Content-Type: text/csv` and `Content-Disposition: att
 
 ---
 
-## 11. Admin — Settings
+## 12. Admin — Settings
 Single org-wide settings row — the **Settings → L-GAV rule values** and **Notifications** cards.
 
 ### `GET http://localhost:8000/api/v1/admin/settings`
@@ -684,8 +767,8 @@ Body — any subset (at least one field, else `400`):
 
 ---
 
-## 12. Admin — Availability
-Base path `/admin/availability`. The admin **opens** a month for availability collection, watches who has submitted, views individual submissions, and nudges stragglers. (Staff fill and submit from the mobile app — §16.)
+## 13. Admin — Availability
+Base path `/admin/availability`. The admin **opens** a month for availability collection, watches who has submitted, views individual submissions, and nudges stragglers. (Staff fill and submit from the mobile app — §17.)
 
 ### `POST http://localhost:8000/api/v1/admin/availability/open`  · open a month
 Creates an availability slot for **every active employee** for the month (existing slots keep what's filled and just get the new cut-off).
@@ -722,7 +805,7 @@ Body: `{ "year": 2026, "month": 12 }`. Sends the employee an `AVAILABILITY_REMIN
 
 ---
 
-## 13. Staff — Shifts
+## 14. Staff — Shifts
 Base path `/shifts`. Staff-guarded (mobile app). Only **published** shifts (notified) are ever visible here.
 
 ### `GET http://localhost:8000/api/v1/shifts`  · available shifts
@@ -746,7 +829,7 @@ Errors: `400` bad enum · `404` shift not published · `409` shift already ended
 
 ---
 
-## 14. Staff — Notifications
+## 15. Staff — Notifications
 Base path `/notifications`. Staff-guarded. Scoped to the caller.
 
 ### `GET http://localhost:8000/api/v1/notifications`
@@ -767,7 +850,7 @@ Notification `type` values you'll see: `SHIFT_OFFER_PUBLISHED` (new shift), `SHI
 
 ---
 
-## 15. Staff — Shift Swaps
+## 16. Staff — Shift Swaps
 Base path `/swaps`. Staff-guarded (mobile app). Employees request to swap their **confirmed** shifts.
 
 ### `POST http://localhost:8000/api/v1/swaps`  · request a swap
@@ -787,7 +870,7 @@ Query: `page`, `limit`, `status`, `role` (`initiated` \| `received`). Returns sw
 
 ---
 
-## 16. Staff — Availability
+## 17. Staff — Availability
 Base path `/availability`. Staff-guarded (mobile app). Employees record their availability & wishes for a month the admin has opened, then submit bindingly before the cut-off.
 
 ### `GET http://localhost:8000/api/v1/availability/:year/:month`  · my availability
@@ -826,7 +909,7 @@ Moves `DRAFT → SUBMITTED` and stamps `submittedAt`. After this the month is re
 
 ---
 
-## 17. Enum Reference
+## 18. Enum Reference
 
 | Enum | Values |
 |------|--------|
@@ -837,13 +920,14 @@ Moves `DRAFT → SUBMITTED` and stamps `submittedAt`. After this the month is re
 | `ShiftApprovalStatus` (admin decision) | `PENDING`, `APPROVED`, `REJECTED` |
 | `ShiftSwapStatus` | `PENDING`, `APPROVED`, `REJECTED`, `CANCELLED` |
 | `PlanStatus` (workload week) | `DRAFT`, `SUBMITTED`, `PUBLISHED` |
+| `DemandWeekStatus` (demands week) | `DRAFT`, `PUBLISHED` |
 | `NotificationType` | `SHIFT_OFFER_PUBLISHED`, `SHIFT_CHANGED`, `SWAP_REQUEST_RECEIVED`, `SWAP_REQUEST_RESULT`, `WEEKLY_SHIFTS_PUBLISHED`, `AVAILABILITY_REMINDER`, `RULE_VIOLATION`, `GENERAL` |
 | `NotificationChannel` | `PUSH`, `EMAIL`, `IN_APP` |
 | `NotificationStatus` | `PENDING`, `SENT`, `FAILED`, `READ` |
 
 ---
 
-## 18. Seed Script
+## 19. Seed Script
 
 Create the default admin (idempotent):
 ```bash
@@ -866,6 +950,7 @@ Credentials: **`admin@adler.com`** / **`Admin@123456`** (change after first logi
 | Admin — Shift Approvals | 4 |
 | Admin — Shift Swaps | 3 |
 | Admin — Workload | 11 |
+| Admin — Demands | 8 |
 | Admin — Reports | 2 |
 | Admin — Settings | 2 |
 | Admin — Availability | 4 |
@@ -873,6 +958,6 @@ Credentials: **`admin@adler.com`** / **`Admin@123456`** (change after first logi
 | Staff — Notifications | 3 |
 | Staff — Shift Swaps | 3 |
 | Staff — Availability | 3 |
-| **Total** | **68** |
+| **Total** | **76** |
 
-> **Not yet implemented (deferred scheduling engine):** the weekly-plan **auto-generation** ("Manage Plans") — automatically turning workload demand + submitted availability into a rule-compliant proposed roster, with hand-adjustment and per-change L-GAV feedback. The **workload / staffing-demand layer is now implemented** (§9, built on the `WeeklyPlan` / `StaffingDemand` models) and employee **availability collection** too (§12 & §16); what remains is only the constraint-solving/roster-generation engine that consumes them. Also open (not blocking): "open to the whole team" swaps (current swaps are targeted) and actual clock-in/out worked-hours capture (reports currently derive hours from approved shifts). Tracked in `implimated.md`.
+> **Not yet implemented (deferred scheduling engine):** the weekly-plan **auto-generation** ("Manage Plans") — automatically turning demand + submitted availability into a rule-compliant proposed roster, with hand-adjustment and per-change L-GAV feedback. The demand side is now built two ways — the day-level **Demands** grid (§10, `DemandWeek` / `DayDemand`) and the shift-slot **Workload** layer (§9, `WeeklyPlan` / `StaffingDemand`) — and employee **availability collection** too (§13 & §17); what remains is only the constraint-solving/roster-generation engine that consumes them. Also open (not blocking): "open to the whole team" swaps (current swaps are targeted) and actual clock-in/out worked-hours capture (reports currently derive hours from approved shifts). Tracked in `implimated.md`.

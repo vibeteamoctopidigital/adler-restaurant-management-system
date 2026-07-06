@@ -8,6 +8,7 @@ import pg from "pg";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "../generated/prisma/client";
 import { hashPassword } from "../utils/bcrypt";
+import { logger } from "../utils/logger";
 
 const DEFAULT_ADMIN = {
   email: "admin@adler.com",
@@ -24,7 +25,7 @@ async function main() {
 
   try {
     await prisma.$connect();
-    console.log("✅ Connected to database.");
+    logger.info("Connected to database.");
 
     // Check if admin already exists
     const existingAdmin = await prisma.admin.findUnique({
@@ -32,8 +33,7 @@ async function main() {
     });
 
     if (existingAdmin) {
-      console.log(`⚠️  Admin already exists: ${DEFAULT_ADMIN.email}`);
-      console.log("   Skipping seed.");
+      logger.warn({ email: DEFAULT_ADMIN.email }, "Admin already exists; skipping seed.");
       return;
     }
 
@@ -49,14 +49,12 @@ async function main() {
       },
     });
 
-    console.log("🌱 Default admin created successfully:");
-    console.log(`   Email:    ${admin.email}`);
-    console.log(`   Password: ${DEFAULT_ADMIN.password}`);
-    console.log(`   ID:       ${admin.id}`);
-    console.log("");
-    console.log("⚠️  Change this password after first login!");
+    logger.info(
+      { email: admin.email, id: admin.id, password: DEFAULT_ADMIN.password },
+      "Default admin created successfully — change this password after first login."
+    );
   } catch (error) {
-    console.error("❌ Seed failed:", error);
+    logger.fatal({ err: error }, "Seed failed.");
     process.exit(1);
   } finally {
     await prisma.$disconnect();

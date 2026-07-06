@@ -1,13 +1,16 @@
 import express, { type Express } from "express";
 import { envConfig } from "./config/env";
+import { logger } from "./utils/logger";
 import { applyMiddleware } from "./middleware";
 import { errorHandler } from "./middleware/errorHandler";
 import { notFound } from "./middleware/notFound";
 import indexRouter from "./routes/index.route";
 const app: Express = express();
 
-
-
+// Trust the configured number of reverse proxies so req.ip is the real client
+// IP (correct rate limiting) rather than the proxy's. A finite hop count avoids
+// the IP-spoofing risk of `trust proxy = true`.
+app.set("trust proxy", envConfig.TRUST_PROXY_HOPS);
 
 applyMiddleware(app);
 app.use("/api/v1",indexRouter)
@@ -35,10 +38,10 @@ export const startServer = async () => {
   try {
     const PORT = envConfig.PORT || 5000;
     app.listen(PORT, () => {
-      console.log(`🚀Blitz Analyzer  Server is running on port ${PORT}`);
+      logger.info({ port: PORT }, "Server started");
     })
   } catch (error) {
-    console.error('❌ Error initializing app:', error);
+    logger.fatal({ err: error }, "Error initializing app");
     process.exit(1);
   }
 };

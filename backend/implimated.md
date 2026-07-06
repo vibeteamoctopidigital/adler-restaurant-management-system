@@ -485,3 +485,79 @@ Mounted `demandRouter` at `/admin/demands` (one import + one `use`).
 ### New Endpoint Count (this iteration)
 **8 new admin endpoints**. **Total project endpoints: 76.**
 
+## 18. Security Hardening — Rate Limiting, Helmet, HPP, Structured Logging & Secret-Leak Fixes
+
+A security pass over the whole backend. All the protective middleware was already installed but **commented out**; this turn wires it in properly, adds layered rate limiting, removes every `console.*` in favour of a redacting structured logger, and closes two secret-leak holes. No endpoint behaviour changed (other than new `429`s under abuse); no schema change; no CI/CD added (per request).
+
+### Rate limiting (`src/middleware/rateLimit.ts` — new)
+Two layered per-IP limiters built on `express-rate-limit`, both returning the standard error envelope (`429`) with `RateLimit-*` + `Retry-After` headers:
+- **`apiLimiter`** — global ceiling on all `/api/v1/**` (default **1000 / 15 min**), health probe exempt. Blunts scraping/abuse without hampering a busy dashboard.
+- **`authLimiter`** — strict limiter on `/auth/(admin|user)/login` and `/refresh` (default **20 / 15 min**) with **`skipSuccessfulRequests: true`**, so **only failed attempts count** — brute-force / credential-stuffing is throttled while a legitimate user is never locked out by their own successful sign-ins.
+- Limits + window are env-tunable (`RATE_LIMIT_WINDOW_MS`, `RATE_LIMIT_MAX`, `AUTH_RATE_LIMIT_MAX`), all optional with sensible defaults.
+
+### Middleware wired in (`src/middleware/index.ts`)
+Uncommented and correctly ordered: **`helmet()`** (HSTS, `nosniff`, frameguard, CSP, hides `x-powered-by`, …) → CORS → compression → cookies → **`express.json({ limit: "1mb" })`** (body-size cap vs. oversized-payload abuse; Stripe raw body preserved) → **`hpp()`** (HTTP Parameter Pollution guard, after the parsers; only touches urlencoded bodies so our JSON arrays are untouched) → **`httpLogger`** (pino) → **`apiLimiter`**.
+
+### Trust proxy (`src/app.ts`)
+`app.set("trust proxy", TRUST_PROXY_HOPS)` (env, default `1`) so `req.ip` is the real client IP behind a reverse proxy — correct rate-limit keying — using a **finite hop count** rather than the spoofable `trust proxy = true`.
+
+### Structured logging + secret-leak fixes
+- Adopted the existing (previously unused) **pino** logger everywhere; **removed all `console.*`** from `src/` (app, errorHandler, db, env, seed). The logger **redacts** `authorization` / `cookie` / `set-cookie`, and pino-http logs request **metadata only** (never bodies) — verified that failed-login passwords never reach the logs.
+- **`config/db.ts`** — was logging the full **`DATABASE_URL`** (credentials!) on every boot. Now logs `"Connected to the database."` with no connection string.
+- **`middleware/errorHandler.ts`** — swapped `console.error` for severity-aware logging (`warn` for expected 4xx, `error` + stack for 5xx); kept the safe `message` mapping (never leaks raw DB/error strings to clients; raw details dev-only) and removed the dead `stack` variable.
+- **`config/cors.ts`** — origin allow-list is now env-driven (`CLIENT_URL` + local dev origin, deduped) instead of a hard-coded single origin; still `credentials: true` with an exact-origin list (never a wildcard).
+
+### Env (`src/config/env.ts`)
+Added optional `RATE_LIMIT_WINDOW_MS`, `RATE_LIMIT_MAX`, `AUTH_RATE_LIMIT_MAX`, `TRUST_PROXY_HOPS` (all with defaults — existing `.env` files keep working), and switched the env-validation failure log to the structured logger (`fatal`).
+
+### Verification (live server)
+- `npx tsc --noEmit` → **0 errors**; **zero `console.*` left** in `src/` (grep-verified).
+- Booted the server and confirmed against real traffic: startup + DB-connect logs carry **no connection string**; responses include helmet headers (HSTS, `nosniff`, `X-Frame-Options`, CSP, Referrer-Policy) and **`x-powered-by` is gone**; `RateLimit-*` headers present (`1000;w=900` global). Hammered `/auth/admin/login` with bad credentials → **20× `401` then `429`** with the correct JSON body + `Retry-After`. Grepped the request logs for `wrongpass` / `DATABASE_URL` / the admin password → **none present**. Server shut down afterwards.
+
+### JWT algorithm pinning (`src/utils/jwt.ts`)
+`jwt.verify` / `jwt.sign` now **pin `HS256`** (`algorithms: ["HS256"]` on verify, `algorithm: "HS256"` on sign). This closes algorithm-confusion and forged **`alg: none`** tokens. Verified at runtime: valid tokens still round-trip; an `alg:none` forgery and a wrong-secret token are both rejected.
+
+### Full security audit (findings)
+A pass over the whole backend confirmed the following are already sound, and were re-verified this turn:
+- **Injection:** no `$queryRaw*` / `$executeRaw*` in app code — every query goes through Prisma's parameterized client (no SQLi). No `child_process` / `eval` / file-upload surface.
+- **Auth flows:** access tokens are signature-verified in the auth middleware; **refresh** verifies the signature **and** matches a stored SHA-256 hash **and** rotates + re-checks `isActive`; logout's `decode`-only step is safely gated by the hash match (a forged token revokes nothing).
+- **Secret exposure:** `passwordHash` is never selected into any projection and never returned (login/profile hand-pick safe fields) — grep-verified. Refresh tokens are stored only as SHA-256 hashes.
+- **Cookies:** `httpOnly` + `secure` + `sameSite=none` on access/refresh cookies.
+- **AuthZ coverage:** every `admin/**` router applies `authorizeAdmin`; every staff router is `authenticate`-guarded — verified by sweep.
+- **Dependencies:** `npm audit` reports high-severity advisories, but they sit entirely in **unused** packages (`pdfjs-dist`/`pdf-ts`, `puppeteer`, `better-auth`, …) that are **not imported anywhere in `src`** — not a reachable attack surface. Recommended follow-up: drop the unused deps (removes the advisories + shrinks the install). Not done here to avoid an unreviewed `package.json`/lockfile change.
+
+> **Deployment note:** set `NODE_ENV=production` in production — the error handler only exposes `originalMessage`/`stack` when `NODE_ENV === "development"` (the schema default), so a prod deploy that leaves it unset would surface internals.
+
+### Endpoint Count
+Unchanged — **76 endpoints**. This is a cross-cutting security hardening, not new routes (it only adds `429` responses under abuse).
+
+## 19. Vercel Deployment Readiness (Serverless)
+
+Adapted the Express app to deploy on **Vercel serverless functions** without changing any endpoint behaviour. Local dev is untouched (`npm run dev` still uses `src/server.ts` + `app.listen()`). Full deploy guide added in `DEPLOYMENT.md`.
+
+### Serverless entry + routing
+- **`api/index.ts`** (new) — `import app from "../src/app"; export default app;`. An Express app *is* a `(req, res)` handler, which is exactly what Vercel invokes. No `listen()` runs on Vercel.
+- **`vercel.json`** (new) — `@vercel/node` build of `api/index.ts` with a catch-all route (`/(.*) → api/index.ts`) that **preserves the original path**, so Express routing (`/api/v1/...`, `/health`) works unchanged. Region pinned to `iad1` (co-located with the Neon `us-east-1` DB).
+
+### Prisma made serverless-safe
+- **`src/lib/prisma.ts`** — the `pg.Pool` + `PrismaClient` are now cached on `globalThis`, so warm invocations reuse one pool instead of opening a new one per cold start (which would exhaust the DB connection limit). Pool size is small + tunable (`DB_POOL_MAX`, default 5); `DATABASE_URL` should point at the Neon **pooled** endpoint.
+- **The query-engine binary** — despite the `@prisma/adapter-pg` driver adapter, this project still generates Prisma's **library (Rust) engine**, so the correct Linux binary must ship in the function. Handled two ways: (1) `binaryTargets = ["native", "rhel-openssl-3.0.x"]` in `base.prisma` so `prisma generate` (run on Vercel via `postinstall`) emits the Lambda-runtime engine; (2) `vercel.json` `includeFiles: ["src/generated/prisma/**"]` bundles it. Verified the generated client resolves the engine via `process.cwd() + src/generated/prisma/...` — which is exactly where `includeFiles` places it in the lambda. The Prisma **schema is inlined** (`inlineSchema`) into the generated client, so no `.prisma` file is read from disk at runtime.
+
+### Build & config
+- Relies on the existing **`postinstall: prisma generate`** (Vercel installs devDeps during build, so the `prisma` CLI is present). No `prisma migrate deploy` runs on Vercel (the `builds` config bypasses the package.json `build` script — schema changes stay a manual `npm run migrate`/`db push`).
+- **`tsconfig.json`** — added `api` to `include` (so the entry point is type-checked) and removed a stale non-existent include path.
+- **`.vercelignore`** (new) — keeps docs/build artifacts out of the upload.
+- **Restored `url = env("DATABASE_URL")`** in `base.prisma` (required by the 6.19 CLI for `generate`; the Prisma-7 IDE server flags it but the CLI needs it). `DATABASE_URL` must be present at **build** time on Vercel (its default) because `generate` reads it.
+
+### Verification
+- `npx tsc --noEmit` → **0 errors** (now including `api/`).
+- `prisma generate` produces the **`libquery_engine-rhel-openssl-3.0.x.so.node`** engine alongside the native one.
+- Imported `api/index.ts` and confirmed the default export is the Express handler **and importing it starts no server** (correct for serverless).
+- Drove requests straight through the exported handler (via `supertest`, no `listen`) exactly as Vercel would: `/health → 200`, `/ → 200`, unknown → `404`, protected route without auth → `401`, all with the security + `RateLimit-*` headers intact.
+- The serverless `prisma` singleton successfully queried the live DB.
+
+> **Deploy checklist (see `DEPLOYMENT.md`):** set Vercel **Root Directory = `backend`** (monorepo), add the required env vars (esp. the Neon **pooled** `DATABASE_URL`, `CLIENT_URL`, the three JWT secrets), and leave the Build Command empty. `NODE_ENV=production` is set by Vercel automatically.
+
+### Endpoint Count
+Unchanged — **76 endpoints**. Deployment plumbing only; no API surface change.
+

@@ -86,7 +86,21 @@ Two shapes exist:
 | `403` | Authenticated but not allowed (wrong role / not the owner) |
 | `404` | Resource not found |
 | `409` | Conflict (duplicate, invalid state transition, resource in use) |
+| `429` | Too many requests (rate limited) |
 | `500` | Server error |
+
+### Rate limiting
+Every response carries standard **`RateLimit-*`** headers (`RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset`); exceeding a limit returns **`429`** with a `Retry-After` header and the standard error envelope.
+
+| Scope | Window | Limit | Notes |
+|-------|--------|-------|-------|
+| Global (all `/api/v1/**`) | 15 min | 1000 / IP | health probe exempt |
+| Auth (`/auth/*/login`, `/auth/*/refresh`) | 15 min | 20 / IP | **only failed attempts count** — successful sign-ins never count toward the limit, so a legitimate user is never locked out |
+
+Limits are per client IP and tunable via env (`RATE_LIMIT_WINDOW_MS`, `RATE_LIMIT_MAX`, `AUTH_RATE_LIMIT_MAX`). `429` body:
+```json
+{ "success": false, "message": "Too many attempts. Please wait a few minutes and try again.", "meta": { "timestamp": "…" } }
+```
 
 ### Pagination
 Most list endpoints use **offset** pagination — they accept `page` (default `1`) and `limit`, and return:

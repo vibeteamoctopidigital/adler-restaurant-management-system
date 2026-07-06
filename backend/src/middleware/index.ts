@@ -4,42 +4,40 @@ import cors from "cors";
 import express, { type Express } from "express";
 import helmet from "helmet";
 import hpp from "hpp";
-import { rateLimit } from "express-rate-limit";
 import { corsConfig } from "../config/cors";
 import { httpLogger } from "../utils/logger";
-
-const apiLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  limit: 100,
-  standardHeaders: true,
-  legacyHeaders: false,
-  skip: (req) => req.path === "/health",
-});
+import { apiLimiter } from "./rateLimit";
 
 export const applyMiddleware = (app: Express): void => {
+  // Security headers (HSTS, no-sniff, frameguard, hides x-powered-by, …).
+  app.use(helmet());
+
+  // CORS with an explicit allow-list + credentials (see config/cors.ts).
   app.use(cors(corsConfig));
-  // app.options('*', cors(corsConfig));
-  // app.use(httpLogger);
-  // app.use(
-  //   helmet({
-  //   contentSecurityPolicy: {
-  //     directives: {
-  //       ...helmet.contentSecurityPolicy.getDefaultDirectives(),
-  //       "script-src": ["'self'", "'unsafe-inline'"], // This allows your inline script to run
-  //     },
-  //   },
-  // })
-  // );
-  // app.use(hpp());
-  // app.use(apiLimiter);
+
   app.use(compression());
   app.use(cookieParser());
 
-  app.use(express.json({
-  verify: (req:any, res, buf) => {
-   if (req.originalUrl.includes('/stripe/webhook')) {
-      req.rawBody = buf;
-    }
-  }
-}));
+  // Cap the JSON body size to blunt oversized-payload abuse. The raw body is
+  // preserved for the Stripe webhook so its signature can be verified.
+  app.use(
+    express.json({
+      limit: "1mb",
+      verify: (req: any, _res, buf) => {
+        if (req.originalUrl.includes("/stripe/webhook")) {
+          req.rawBody = buf;
+        }
+      },
+    })
+  );
+
+  // Guard against HTTP Parameter Pollution (must run after the body/query
+  // parsers so duplicate params are collapsed to a single value).
+  app.use(hpp());
+
+  // Structured request logging (auth/cookie headers are redacted — see logger).
+  app.use(httpLogger);
+
+  // Global per-IP rate limit (health probe exempt).
+  app.use(apiLimiter);
 };

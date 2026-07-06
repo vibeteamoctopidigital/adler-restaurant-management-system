@@ -1,5 +1,6 @@
 import dotenv from 'dotenv';
 import { z } from 'zod';
+import { logger } from '../utils/logger';
 
 dotenv.config();
 
@@ -17,15 +18,22 @@ const envSchema = z.object({
   REFRESH_TOKEN_SECRET: z.string().min(32),
   REFRESH_TOKEN_EXPIRES_IN: z.string().default('7d'),
 
+  // Rate limiting (per client IP). Optional — sensible defaults applied.
+  RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(15 * 60 * 1000),
+  RATE_LIMIT_MAX: z.coerce.number().int().positive().default(1000),
+  AUTH_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(20),
 
-
+  // Number of reverse proxies in front of the app (for correct client IPs).
+  TRUST_PROXY_HOPS: z.coerce.number().int().min(0).default(1),
 });
 
 const parsed = envSchema.safeParse(process.env);
 
 if (!parsed.success) {
-  console.error('❌ Invalid or missing environment variables:');
-  console.error(JSON.stringify(parsed.error.flatten().fieldErrors, null, 2));
+  logger.fatal(
+    { fieldErrors: parsed.error.flatten().fieldErrors },
+    'Invalid or missing environment variables'
+  );
   process.exit(1);
 }
 

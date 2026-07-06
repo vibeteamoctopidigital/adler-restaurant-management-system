@@ -1,16 +1,13 @@
-
 import { prisma } from '../lib/prisma';
-import { envConfig } from './env';
-
-
+import { logger } from '../utils/logger';
 
 export const connectToDatabase = async (): Promise<void> => {
   try {
     await prisma.$connect();
-    // eslint-disable-next-line no-console
-    console.log('\n ✅ Connected to database at:', envConfig.DATABASE_URL);
+    // Never log the connection string — it carries credentials.
+    logger.info('Connected to the database.');
   } catch (err) {
-    console.error('❌ Database connection failed:', err);
+    logger.fatal({ err }, 'Database connection failed.');
     process.exit(1);
   }
 };

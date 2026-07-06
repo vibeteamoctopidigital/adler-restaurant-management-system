@@ -1,32 +1,26 @@
 // Vercel serverless entry point.
 //
-// The Express app is loaded lazily (dynamic import) and wrapped so that any
-// failure during initialization — a missing env var, a Prisma engine problem,
-// etc. — is caught and returned as a readable JSON 500 instead of an opaque
-// `FUNCTION_INVOCATION_FAILED` crash. The app itself is a `(req, res)` handler,
-// which is exactly what Vercel invokes. (Local dev still uses `src/server.ts`.)
-import { logger } from "../src/utils/logger";
+// This module has ZERO fallible top-level imports so it always loads. The
+// Express app is imported lazily inside the handler and wrapped in try/catch,
+// so ANY initialization failure (missing env var, Prisma/engine problem, bad
+// import, …) is reported as a readable JSON 500 and logged to stderr (visible
+// in Vercel's Runtime Logs) instead of an opaque `FUNCTION_INVOCATION_FAILED`.
+//
+// An Express app is itself a `(req, res)` handler, which is what Vercel invokes.
+// (Local dev still uses `src/server.ts`, which calls `app.listen()`.)
 
 type NodeHandler = (req: unknown, res: unknown) => unknown;
 
-let cachedApp: NodeHandler | undefined;
-let initError: unknown;
-
-const loadApp = async (): Promise<void> => {
-  if (cachedApp || initError) return;
-  try {
-    cachedApp = (await import("../src/app")).default as NodeHandler;
-  } catch (err) {
-    initError = err;
-  }
-};
-
 export default async function handler(req: any, res: any) {
-  await loadApp();
-
-  if (initError) {
-    const message = initError instanceof Error ? initError.message : String(initError);
-    logger.fatal({ err: initError }, "Backend failed to initialize");
+  try {
+    // Node caches this module (and any load error) after the first import, so
+    // repeated calls are cheap and a failed init keeps reporting the same cause.
+    const app = ((await import("../src/app")).default as unknown) as NodeHandler;
+    return app(req, res);
+  } catch (err: any) {
+    const message = err?.message ?? String(err);
+    // eslint-disable-next-line no-console
+    console.error("Backend failed to initialize:", err);
     res.statusCode = 500;
     res.setHeader("content-type", "application/json");
     res.end(
@@ -36,8 +30,5 @@ export default async function handler(req: any, res: any) {
         error: message,
       })
     );
-    return;
   }
-
-  return cachedApp!(req, res);
 }

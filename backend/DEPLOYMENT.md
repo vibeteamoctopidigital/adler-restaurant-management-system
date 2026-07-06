@@ -3,23 +3,32 @@
 This backend is an Express app adapted to run as a **Vercel serverless function**.
 Everything needed is already in the repo — follow the steps below.
 
-## What's wired up
+## How it works
+
+The whole app is **pre-bundled into a single file** with esbuild, so the deployed
+function has no relative `../src/...` imports for Node's ESM loader to fail on
+(that was the cause of the earlier `ERR_MODULE_NOT_FOUND` crashes). Third-party
+packages stay external and load from `node_modules`.
 
 | File | Purpose |
 |------|---------|
-| `api/index.ts` | Serverless entry — exports the Express `app` as the request handler (no `app.listen()`). |
-| `vercel.json` | Routes every path to the function, bundles the Prisma engine (`includeFiles`), pins region `iad1`. |
+| `src/vercel.ts` | Bundle entry — `import app from "./app"; export default app;`. |
+| `api/index.js` | The **bundled** function esbuild produces (rebuilt on every install). This is what Vercel runs. |
+| `build:vercel` (package.json) | `esbuild src/vercel.ts --bundle --format=esm --packages=external → api/index.js`. |
+| `postinstall` (package.json) | `prisma generate && npm run build:vercel` — regenerates the client and rebuilds the bundle on Vercel. |
+| `vercel.json` | Routes every path to `api/index.js` and bundles the Prisma engine (`includeFiles`). |
 | `src/lib/prisma.ts` | Reuses one Pool + PrismaClient across warm invocations (won't exhaust DB connections). |
 | `prisma/schemas/base.prisma` | `binaryTargets` includes `rhel-openssl-3.0.x` so the query engine matches Vercel's runtime. |
-| `postinstall` (package.json) | Runs `prisma generate` during install so the client is built on Vercel. |
+| `src/config/env.ts` | Invalid env no longer crashes the function — it returns a readable `500` (env-guard in `app.ts`). |
 
 Local development is unchanged: `npm run dev` still uses `src/server.ts` (which calls `app.listen()`).
 
 ## Step 1 — Import the project
 
 1. In Vercel, **New Project → import this Git repo**.
-2. **Set the Root Directory to `backend`.** This is a monorepo (the repo also contains the frontend), so Vercel must build from `backend/`, where `vercel.json` lives. **This is the most common cause of a failed deploy.**
-3. Leave the **Build Command** and **Output Directory** empty — `vercel.json` drives the build. (Do **not** set it to `npm run build`; that script runs `prisma migrate deploy`, which you don't want here.)
+2. **Set the Root Directory to `backend`. This is REQUIRED and non-negotiable.** The repo is a monorepo (it also contains the frontends), so Vercel must build from `backend/` — that's where `package.json` (deps), `vercel.json`, and `api/` live. If the deploy logs show paths like `/var/task/**backend**/...`, the Root Directory is still wrong.
+   - Path in the dashboard: **Settings → General → Root Directory → Edit → type `backend` → Save**, then redeploy.
+3. Leave the **Build Command** and **Output Directory** empty — `vercel.json` drives the build. (Do **not** set the build command to `npm run build`; that script runs `prisma migrate deploy`, which you don't want here.)
 
 ## Step 2 — Environment variables
 

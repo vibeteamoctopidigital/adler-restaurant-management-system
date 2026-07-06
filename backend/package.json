@@ -12,11 +12,13 @@
     "prisma:generate": "prisma generate",
     "start": "node dist/server.js",
     "lint": "eslint . --ext .ts",
-    "stripe:webhook": "stripe listen --forward-to localhost:5000/api/v1/stripe/webhook"
+    "stripe:webhook": "stripe listen --forward-to localhost:5000/api/v1/stripe/webhook",
+    "seed": "prisma db seed"
   },
   "author": "",
   "license": "ISC",
   "devDependencies": {
+    "@faker-js/faker": "^10.5.0",
     "@types/compression": "^1.8.1",
     "@types/cookie-parser": "^1.4.10",
     "@types/cors": "^2.8.19",
@@ -95,5 +97,8 @@
     "ua-parser-js": "^2.0.10",
     "uuid": "^13.0.0",
     "zod": "^3.25.56"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
   }
 }

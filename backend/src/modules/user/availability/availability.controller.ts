@@ -3,6 +3,19 @@ import { userAvailabilityServices } from "./availability.service";
 import { sendSuccess } from "../../../utils/apiResponse";
 import type { SetDaysInput } from "./availability.validation";
 
+// ─── List my availability months ─────────────────────────────────
+export const listMyMonths = async (_req: Request, res: Response): Promise<void> => {
+  const userId = res.locals.auth!.userId;
+
+  const months = await userAvailabilityServices.listMyMonths(userId);
+
+  sendSuccess(res, {
+    statusCode: 200,
+    message: "Availability months fetched successfully.",
+    data: { months },
+  });
+};
+
 // ─── Get my availability for a month ─────────────────────────────
 export const getMyMonth = async (req: Request, res: Response): Promise<void> => {
   const userId = res.locals.auth!.userId;

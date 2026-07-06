@@ -97,6 +97,63 @@ const getMonthStatus = async (year: number, month: number) => {
   };
 };
 
+// ─── Full grid: every employee's availability days for a month ───
+// One call that gives the admin dashboard the complete picture — each active
+// employee with their submitted (or draft) day-by-day availability — so it can
+// render the availability grid that feeds weekly planning.
+const getMonthGrid = async (year: number, month: number) => {
+  const users = await prisma.user.findMany({
+    where: { isActive: true },
+    orderBy: { createdAt: "asc" },
+    select: { id: true, name: true, firstName: true, lastName: true, email: true },
+  });
+
+  const months = await prisma.availabilityMonth.findMany({
+    where: { year, month, userId: { in: users.map((u) => u.id) } },
+    select: {
+      userId: true,
+      status: true,
+      submittedAt: true,
+      cutoffAt: true,
+      days: {
+        orderBy: { date: "asc" },
+        select: {
+          id: true,
+          date: true,
+          status: true,
+          note: true,
+          preferredStartTime: true,
+          preferredEndTime: true,
+        },
+      },
+    },
+  });
+  const byUser = new Map(months.map((m) => [m.userId, m]));
+
+  const employees = users.map((u) => {
+    const m = byUser.get(u.id);
+    return {
+      userId: u.id,
+      name: u.name,
+      firstName: u.firstName,
+      lastName: u.lastName,
+      email: u.email,
+      status: m ? m.status : ("NOT_OPENED" as const),
+      submittedAt: m?.submittedAt ?? null,
+      cutoffAt: m?.cutoffAt ?? null,
+      days: m?.days ?? [],
+    };
+  });
+
+  const submitted = employees.filter((e) => e.status === "SUBMITTED").length;
+  return {
+    year,
+    month,
+    employees,
+    summary: { total: employees.length, submitted, notSubmitted: employees.length - submitted },
+  };
+};
+
 // ─── A single employee's availability for a month ────────────────
 const getUserMonth = async (userId: string, year: number, month: number) => {
   const m = await prisma.availabilityMonth.findUnique({
@@ -146,6 +203,7 @@ const nudge = async (userId: string, year: number, month: number) => {
 export const adminAvailabilityServices = {
   openMonth,
   getMonthStatus,
+  getMonthGrid,
   getUserMonth,
   nudge,
 };

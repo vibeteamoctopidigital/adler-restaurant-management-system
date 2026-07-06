@@ -9,6 +9,9 @@ const userAvailabilityRouter = Router();
 
 userAvailabilityRouter.use(authenticate, authorizeUser);
 
+// My availability months — which are open / editable / submitted.
+userAvailabilityRouter.get("/", asyncHandler(availabilityController.listMyMonths));
+
 // My availability for a month.
 userAvailabilityRouter.get("/:year/:month", asyncHandler(availabilityController.getMyMonth));
 

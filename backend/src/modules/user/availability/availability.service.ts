@@ -42,6 +42,36 @@ const loadEditableMonth = async (userId: string, year: number, month: number) =>
   return m;
 };
 
+// ─── List my availability months (which ones are open to submit) ─
+const listMyMonths = async (userId: string) => {
+  const months = await prisma.availabilityMonth.findMany({
+    where: { userId },
+    orderBy: [{ year: "desc" }, { month: "desc" }],
+    select: {
+      id: true,
+      year: true,
+      month: true,
+      status: true,
+      cutoffAt: true,
+      submittedAt: true,
+      _count: { select: { days: true } },
+    },
+  });
+
+  const now = Date.now();
+  return months.map((m) => ({
+    id: m.id,
+    year: m.year,
+    month: m.month,
+    status: m.status,
+    cutoffAt: m.cutoffAt,
+    submittedAt: m.submittedAt,
+    dayCount: m._count.days,
+    // The app can show/hide the "edit availability" action based on this.
+    editable: m.status === "DRAFT" && m.cutoffAt.getTime() > now,
+  }));
+};
+
 // ─── Get my availability for a month ─────────────────────────────
 const getMyMonth = async (userId: string, year: number, month: number) => {
   const m = await prisma.availabilityMonth.findUnique({
@@ -116,6 +146,7 @@ const submit = async (userId: string, year: number, month: number) => {
 };
 
 export const userAvailabilityServices = {
+  listMyMonths,
   getMyMonth,
   setDays,
   submit,

@@ -37,6 +37,18 @@ export const getMonthStatus = async (req: Request, res: Response): Promise<void>
   });
 };
 
+// ─── Full grid: all employees' availability days for a month ─────
+export const getMonthGrid = async (req: Request, res: Response): Promise<void> => {
+  const { year, month } = req.validated as AvailabilityQuery;
+  const result = await adminAvailabilityServices.getMonthGrid(year, month);
+
+  sendSuccess(res, {
+    statusCode: 200,
+    message: "Availability grid fetched successfully.",
+    data: result,
+  });
+};
+
 // ─── One employee's availability ─────────────────────────────────
 export const getUserMonth = async (req: Request, res: Response): Promise<void> => {
   const userId = req.params.userId as string;

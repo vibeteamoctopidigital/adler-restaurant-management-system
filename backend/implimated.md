@@ -586,3 +586,26 @@ Full user-side auth surface now: `POST /login`, `POST /refresh`, `GET /profile`,
 ### New Endpoint Count (this iteration)
 **1 new endpoint** (`PATCH /auth/user/profile`), plus mobile-friendly upgrades (Bearer auth, tokens-in-body) to the existing user login/refresh/logout. **Total project endpoints: 77.**
 
+### User features — Auth, Availability, Swaps (verified end-to-end)
+The three staff features were confirmed working through the real HTTP routes (with Bearer auth), and one usability gap was closed.
+
+- **Auth / password update** — login (email + admin-set password), `PATCH /auth/user/profile` (edit email + password), logout. Covered above; re-confirmed.
+- **Availability (calendar)** — `user/availability` already had `GET /:year/:month`, `PUT /:year/:month/days` (full-replace calendar of `AVAILABLE`/`UNAVAILABLE`/`WISH` + note + preferred times), `POST /:year/:month/submit`. **Added `GET /api/v1/availability`** — lists the user's months with an **`editable`** flag (DRAFT + before cut-off), so the mobile app knows which month is open without guessing. Service `listMyMonths` + controller + route.
+- **Shift swaps** — `user/swaps` (`POST /` request, `GET /` my swaps, `POST /:id/cancel`) → admin `POST /admin/swaps/:id/approve` performs the exchange in one transaction and notifies both. All pre-existing; verified.
+
+**Verification (supertest + live DB), all green:**
+- *Availability:* open month → `GET` DRAFT → `PUT` saves 3 calendar days (WISH note + preferred times round-trip) → date-outside-month `400`, duplicate-date `400` → `submit` → `SUBMITTED` → edit-after-submit `409` → unopened month `404`; `GET /availability` lists months newest-first with the correct `editable` flags.
+- *Swaps:* two users each admin-confirmed on a shift → user A `POST /swaps` → `201 PENDING`, recipient B notified → same-shift `400`, duplicate-pending `409` → B sees it in `role=received` → **admin approve exchanges the shifts** (A now confirmed on B's shift and vice-versa), **both notified**, swap `APPROVED`.
+- All `USER` routes reject admin tokens (`403`) and no-token requests (`401`); Bearer auth works throughout. Test data cleaned up.
+
+### Endpoint Count (this iteration)
+**1 new endpoint** (`GET /api/v1/availability`). **Total project endpoints: 78.**
+
+### Submitted availability visible in the admin dashboard
+Closed the loop so a user's submitted availability shows up on the admin side. The admin module already had `GET /admin/availability` (per-employee submission **status** + `filledDays` count) and `GET /admin/availability/:userId` (one employee's full `days[]`). **Added `GET /api/v1/admin/availability/grid?year=&month=`** — the whole month in one call: every active employee with their **day-by-day** entries (`AVAILABLE`/`UNAVAILABLE`/`WISH` + note + preferred times) + status + a summary. This is the consolidated data the dashboard needs to render the availability grid that feeds weekly planning, instead of fetching one employee at a time. New `getMonthGrid` service + controller + route (declared **before** `/:userId` so `grid` isn't captured as a userId).
+
+**Verification (supertest + live DB), 14/14 green:** admin opens a month → user A saves 3 calendar days + submits → **admin status view** shows A `SUBMITTED` (`filledDays:3`) and B in the `notSubmitted` list → **admin per-employee view** returns A's exact days (WISH note round-trips) with the user identity → **admin grid** returns A (`SUBMITTED`, 3 days) and B (`DRAFT`, 0 days) with a correct summary → guards: no-auth `401`, user token `403`, missing query params `400`. Test data cleaned up.
+
+### Endpoint Count (this iteration)
+**1 new endpoint** (`GET /admin/availability/grid`). **Total project endpoints: 79.**
+

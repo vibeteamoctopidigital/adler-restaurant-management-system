@@ -814,6 +814,23 @@ Creates an availability slot for **every active employee** for the month (existi
 ```
 `status` is `SUBMITTED` \| `DRAFT` \| `LOCKED` \| `NOT_OPENED` (the last means the employee has no slot for that month, e.g. hired after it was opened).
 
+### `GET http://localhost:8000/api/v1/admin/availability/grid?year=2026&month=12`  · full grid (every employee's days)
+The whole month's availability in one call — each active employee **with their day-by-day entries** — so the dashboard can render the availability grid that feeds weekly planning (rather than fetching one employee at a time).
+```json
+{ "success": true, "data": {
+    "year": 2026, "month": 12,
+    "employees": [
+      { "userId": "…", "name": "Anna Müller", "firstName": null, "lastName": null, "email": "…",
+        "status": "SUBMITTED", "submittedAt": "…", "cutoffAt": "…",
+        "days": [
+          { "id": "…", "date": "2026-12-05", "status": "WISH", "note": "prefer morning",
+            "preferredStartTime": "2026-12-05T08:00:00.000Z", "preferredEndTime": "2026-12-05T14:00:00.000Z" } ] },
+      { "userId": "…", "name": "Luca Rossi", "status": "DRAFT", "submittedAt": null, "days": [] }
+    ],
+    "summary": { "total": 12, "submitted": 9, "notSubmitted": 3 } } }
+```
+`status` per employee is `SUBMITTED` \| `DRAFT` \| `LOCKED` \| `NOT_OPENED`; `days` carries what the employee entered (empty until they fill it in).
+
 ### `GET http://localhost:8000/api/v1/admin/availability/:userId?year=2026&month=12`  · one employee's submission
 Returns that employee's month with the full `days[]` (each: `date`, `status`, `note`, `preferredStartTime`, `preferredEndTime`) plus the `user`. `404` if they have no slot for the month.
 
@@ -889,6 +906,15 @@ Query: `page`, `limit`, `status`, `role` (`initiated` \| `received`). Returns sw
 
 ## 17. Staff — Availability
 Base path `/availability`. Staff-guarded (mobile app). Employees record their availability & wishes for a month the admin has opened, then submit bindingly before the cut-off.
+
+### `GET http://localhost:8000/api/v1/availability`  · my availability months
+Which months I have — so the app knows what's open to submit. Newest first.
+```json
+{ "success": true, "data": { "months": [
+    { "id": "…", "year": 2026, "month": 12, "status": "DRAFT", "cutoffAt": "…", "submittedAt": null,
+      "dayCount": 0, "editable": true } ] } }
+```
+`editable` is `true` only while `status = DRAFT` **and** the cut-off is still in the future.
 
 ### `GET http://localhost:8000/api/v1/availability/:year/:month`  · my availability
 ```json
@@ -1029,7 +1055,30 @@ When `passwordChanged` is `true`, the message is *"Profile updated. Please log i
 ### `POST http://localhost:8000/api/v1/auth/user/logout`  · user (Bearer)
 Body (mobile): `{ "refreshToken": "<stored refresh token>" }` — or the cookie. Revokes that refresh token (and clears cookies). The app should also delete its stored tokens. `200`.
 
-> **Other staff endpoints** — view/accept shifts (§14), notifications (§15), swaps (§16), availability (§17) — are all `USER`-scoped and accept the same `Authorization: Bearer <token>` header. Refer to those sections for their payloads.
+### Availability (submit with a calendar)
+Employees record per-day availability for a month the admin has opened, then submit it bindingly before the cut-off. All `USER`-scoped, Bearer.
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /api/v1/availability` | List my months + `editable` flag — so the app knows what's open (§17). |
+| `GET /api/v1/availability/:year/:month` | My calendar for the month (`days[]` with `AVAILABLE` / `UNAVAILABLE` / `WISH` + note + preferred times). `404` if not opened. |
+| `PUT /api/v1/availability/:year/:month/days` | **Full replace** of my day entries — the app sends the whole calendar. Editable only while `DRAFT` + before cut-off (`409` after). |
+| `POST /api/v1/availability/:year/:month/submit` | Submit bindingly (`DRAFT → SUBMITTED`). Read-only afterwards. |
+
+Each day: `{ "date": "2026-12-05", "status": "WISH", "note": "…", "preferredStartTime": "…", "preferredEndTime": "…" }` (`date` must fall in the target month; no duplicates). Full detail in §17.
+
+### Shift swaps (request → admin approval → both updated)
+An employee offers one of **their confirmed shifts** in exchange for a **colleague's confirmed shift**; the request goes to the admin, and on approval both schedules are updated and both are notified.
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /api/v1/swaps` | Request a swap: `{ initiatorShiftId, recipientUserId, recipientShiftId, reason? }`. Both employees must currently be admin-confirmed on the named shifts. Notifies the recipient. `201` (`PENDING`). |
+| `GET /api/v1/swaps` | My swaps (filter `status`, `role=initiated\|received`). |
+| `POST /api/v1/swaps/:swapId/cancel` | Cancel my own pending request. |
+
+The admin then **approves/rejects** on `/api/v1/admin/swaps` (§8). On **approve**, the two confirmed assignments are exchanged in one transaction and **both employees are notified** (`SWAP_REQUEST_RESULT`); the swap becomes `APPROVED`. Guards: self-swap / same shift → `400`, a duplicate pending swap → `409`, a shift no longer confirmed → `409`. Full detail in §16 (staff) + §8 (admin).
+
+> **Other staff endpoints** — view/accept shifts (§14) and notifications (§15) — are also `USER`-scoped and accept the same `Authorization: Bearer <token>` header.
 
 ---
 
@@ -1049,11 +1098,11 @@ Body (mobile): `{ "refreshToken": "<stored refresh token>" }` — or the cookie.
 | Admin — Demands | 8 |
 | Admin — Reports | 2 |
 | Admin — Settings | 2 |
-| Admin — Availability | 4 |
+| Admin — Availability | 5 |
 | Staff — Shifts | 3 |
 | Staff — Notifications | 3 |
 | Staff — Shift Swaps | 3 |
-| Staff — Availability | 3 |
-| **Total** | **77** |
+| Staff — Availability | 4 |
+| **Total** | **79** |
 
 > **Not yet implemented (deferred scheduling engine):** the weekly-plan **auto-generation** ("Manage Plans") — automatically turning demand + submitted availability into a rule-compliant proposed roster, with hand-adjustment and per-change L-GAV feedback. The demand side is now built two ways — the day-level **Demands** grid (§10, `DemandWeek` / `DayDemand`) and the shift-slot **Workload** layer (§9, `WeeklyPlan` / `StaffingDemand`) — and employee **availability collection** too (§13 & §17); what remains is only the constraint-solving/roster-generation engine that consumes them. Also open (not blocking): "open to the whole team" swaps (current swaps are targeted) and actual clock-in/out worked-hours capture (reports currently derive hours from approved shifts). Tracked in `implimated.md`.

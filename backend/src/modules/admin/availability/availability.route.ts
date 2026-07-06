@@ -27,6 +27,14 @@ adminAvailabilityRouter.get(
   asyncHandler(availabilityController.getMonthStatus)
 );
 
+// Full grid — every employee's availability days for a month (?year=&month=).
+// Defined before "/:userId" so "grid" isn't captured as a userId.
+adminAvailabilityRouter.get(
+  "/grid",
+  validateRequest(availabilityQuerySchema),
+  asyncHandler(availabilityController.getMonthGrid)
+);
+
 // A single employee's submitted availability (?year=&month=).
 adminAvailabilityRouter.get(
   "/:userId",

@@ -1,0 +1,22 @@
+// A per-month gate that controls whether staff can see their confirmed
+// schedule. Management plans/confirms shifts privately (DRAFT); once the month
+// is PUBLISHED the approved shifts become visible on the staff app. This is why
+// "August isn't published yet" is shown to staff until an admin publishes.
+model SchedulePublication {
+  id     String                    @id @default(cuid())
+  year   Int
+  month  Int // 1–12
+  status SchedulePublicationStatus @default(DRAFT)
+  note   String?
+
+  publishedAt   DateTime?
+  publishedById String?
+  publishedBy   Admin?    @relation("SchedulePublishedBy", fields: [publishedById], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([year, month])
+  @@index([status])
+  @@map("schedule_publications")
+}

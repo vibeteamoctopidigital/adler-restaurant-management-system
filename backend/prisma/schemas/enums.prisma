@@ -96,3 +96,8 @@ enum ShiftSwapStatus {
   REJECTED
   CANCELLED
 }
+
+enum SchedulePublicationStatus {
+  DRAFT
+  PUBLISHED
+}

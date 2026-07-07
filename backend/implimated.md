@@ -609,3 +609,83 @@ Closed the loop so a user's submitted availability shows up on the admin side. T
 ### Endpoint Count (this iteration)
 **1 new endpoint** (`GET /admin/availability/grid`). **Total project endpoints: 79.**
 
+## 20. Staff **My Schedule** — Month Publish Gate + Day/Week/Month Sorting
+
+Closes the staff-facing scheduling loop shown in the mobile screens: management plans/confirms a month privately, **publishes** it, and only then does the employee's confirmed schedule appear on their **Schedule** tab — sortable by day, week, or month. Until publish, the tab reads *"August isn't published yet — drafts are never visible to staff."*
+
+> **Design note — new `SchedulePublication` model, not an overload of `WeeklyPlan`.** The staff "My schedule" needs a simple per-month visibility gate over the **functional** shift model (`ShiftOffer` + admin-`APPROVED` `ShiftOfferResponse`). `WeeklyPlan`/`PlanStatus` belongs to the deferred auto-scheduling engine and is week-based; overloading it would tangle two concerns. So a small purpose-built table was added — consistent with how this codebase added `ShiftOffer` instead of overloading `Shift`, and `ShiftSwapRequest` instead of `SwapRequest`.
+
+### Schema Changes (`prisma/schemas/`)
+- **New enum** `SchedulePublicationStatus { DRAFT, PUBLISHED }` (`enums.prisma`).
+- **New model** `SchedulePublication` (`schedulePublication.prisma`): `@@unique([year, month])`, `status` (default `DRAFT`), `note`, `publishedAt`, `publishedById` (→ `Admin`). Back-relation `publishedSchedules` added on `Admin`. Regenerated the client + `db push` (**additive**: one new table + one new enum — non-destructive).
+
+### Admin Schedule Module (`src/modules/admin/schedule/`, `/api/v1/admin/schedule`) — admin-guarded
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /publish` | `{ year, month, note? }` → upsert the month to `PUBLISHED` (stamps `publishedAt`/`publishedById`) and fan out a `WEEKLY_SHIFTS_PUBLISHED` in-app notification to **every active employee confirmed for ≥1 shift that month**. Returns `notifiedCount` + a `summary` (`confirmedShifts`, `employeesScheduled`, `scheduledHours`). Re-publish re-notifies. |
+| `POST /unpublish` | `{ year, month }` → back to `DRAFT` (clears `publishedAt`), hiding it from staff. `409` if not currently published. |
+| `GET /?year=&month=` | Month status (`PUBLISHED`/`DRAFT`/`NOT_PUBLISHED`) + the confirmed-schedule summary. Defaults to the current month. |
+| `GET /publications` | Paginated publication history (`status` filter). |
+
+### Staff Schedule Module (`src/modules/user/schedule/`, `/api/v1/schedule`) — staff-guarded
+- `GET /schedule?view=day|week|month&date=&year=&month=` — the caller's **confirmed** shifts (admin-`APPROVED` `ShiftOfferResponse`) for the window, **gated by publication**. `view` sorts by single day / **Monday-based** week / calendar month (mirrors the workload/demands view). A week can straddle two months, so each touched month is gated independently and reported in `months[]`; `published` is the AND across them. Returns `groups` (bucketed by calendar day, each with `hours`), a flat `shifts[]` ordered by `startTime`, and `totals { shiftCount, scheduledHours }`. Single-month windows also expose a top-level `period` + `publishedAt` that drive the "not published yet" empty state.
+- `GET /schedule/months` — published months (newest-first) for the app's month switcher.
+
+### Notify reuse
+Used the **already-existing** `WEEKLY_SHIFTS_PUBLISHED` enum value (previously defined but unemitted) for the publish notification — matching the screen's "You'll get a notification the moment your schedule is approved."
+
+### Verification
+- `npx tsc --noEmit` → **0 errors** (strict mode, incl. `exactOptionalPropertyTypes` + `noUncheckedIndexedAccess`).
+- Router introspection: 4 admin + 2 staff routes register; index router now mounts 18 sub-routers.
+- **Full E2E against the live server + DB**, all confirmed: seed admin → create category + employee → create shift (08 Aug 2026, 17:00–23:30) + notify → employee accepts → admin approves → **staff `/schedule` before publish → `published:false`, 0 shifts, `period:"August 2026"`** → **admin publishes Aug → notifies 1 employee, summary `{confirmedShifts:1, employeesScheduled:1, scheduledHours:6.5}`** → **staff month view → `published:true`, 1 shift, grouped `2026-08-08` (6.5h), `confirmedAt` set** → **week view → Monday-based range `2026-08-03..2026-08-09`** → **day view Aug 8 (1 shift) / Aug 9 (0)** → `/schedule/months` lists August 2026 → admin status `PUBLISHED` → **unpublish → staff back to `published:false`** → guards: admin→staff route `403`, unpublish-when-draft `409`, bad `view` value `400`. All test data cleaned up afterwards.
+
+### New Endpoint Count (this iteration)
+**6 new endpoints** (4 admin schedule + 2 staff schedule). **Total project endpoints: 85.**
+
+## 21. Shift Offers — 1-Minute Auto-Removal from the Staff App
+
+The admin-posted job → staff accept/decline flow already existed (`ShiftOffer` create + `notify` → `GET /shifts` → `POST /shifts/:id/respond`). This iteration adds the requested rule: **a job is auto-removed from the staff site once it is within 1 minute of its start time** (or has already started).
+
+### Design — a query-time cutoff, not a delete or a cron
+- "Removed from the user site" means **hidden from the staff open-offers view**, not deleted. The `ShiftOffer` stays intact so the admin still sees it (§6/§7) and its responses/approvals/reports are preserved.
+- Enforced at **query time** (`startTime > now + 60s`), which is deterministic on Vercel serverless — no background worker / scheduled job that could miss firing. Every fetch naturally excludes shifts inside the window.
+- Scoped to the **open-offers** module only (`src/modules/user/shifts/`). It does **not** touch **My Schedule** (§19) — a shift the employee is already confirmed for still shows there, including today's.
+
+### Changes (`src/modules/user/shifts/shifts.service.ts`)
+- Added `RESPONSE_CUTOFF_MS = 60_000` and `openOffersFrom()`.
+- `listAvailableShifts` — `where.startTime = { gt: openOffersFrom() }`.
+- `getShiftForUser` — same filter → a within-cutoff shift returns `404` (removed).
+- `respondToShift` — replaced the old "already ended" guard with a cutoff check: `startTime <= now + 60s → 409` "This shift is no longer open for responses." (also covers already-started/ended shifts).
+
+### Verification
+- `npx tsc --noEmit` → **0 errors** (strict mode).
+- **Full E2E against the live server + DB**: admin posts two notified jobs — **A** starting in **30s** (inside the cutoff) and **B** in **10min** — then, as staff: `GET /shifts` returns **only B** (A auto-removed) → `GET /shifts/A` → **404**, `GET /shifts/B` → **200** → respond to A → **409 "no longer open"** → accept then reject B → **200/200** (accept/decline still works) → **admin `GET /admin/shifts` still lists both A and B** (not deleted, admin-side unaffected). All test data cleaned up afterwards.
+
+### Endpoint Count
+Unchanged — **85 endpoints**. This is a behavioural rule on the existing staff shift reads/respond, documented in `API_Doc.md` §14.
+
+## 22. Full User-Site Audit & End-to-End Verification
+
+Senior pass over the **entire staff (user) API surface** to confirm all six user-site requirements work — reading every user module (`auth`, `availability`, `swaps`, `shifts`, `notifications`, `schedule`) and exercising the whole journey against the live server + database.
+
+### Requirements re-verified (all green)
+1. **Login + change password** — login with the admin-issued password; `PATCH /auth/user/profile` verifies the current password, re-hashes, and **revokes all refresh tokens + clears the session** (old password → `401`, new → `200`; `newPassword` without `currentPassword` → `400`).
+2. **Availability via calendar** — open → `GET` → `PUT days` → `submit`; the in-month, duplicate-date, cut-off, and already-submitted guards all fire (`400`/`409`).
+3. **Availability visible to admin** — `GET /admin/availability` (status + `filledDays`) and `/grid` (day-by-day) reflect the submission.
+4. **Swap → admin approve → both updated** — create (recipient notified `SWAP_REQUEST_RECEIVED`) → admin sees the pending swap with an advisory `ruleCheck` → approve **atomically exchanges** the confirmed shifts (Shift A → recipient, Shift B → initiator) and notifies both (`SWAP_REQUEST_RESULT`); self-swap → `400`, duplicate pending → `409`.
+5. **Published schedule, sortable** — publish the month → each employee sees only their own confirmed shift, sortable by day/week/month. (Run against the **post-swap** assignments, so this also confirms #4 propagated into the schedule.)
+6. **Job offers + 1-min auto-removal** — a job within 1 minute of start is removed from the offers list (`GET`→`404`, respond→`409`); a later job accepts/rejects fine; the admin still sees both (never deleted).
+
+### Coverage
+Two assertion suites against the live DB: the earlier schedule/expiry suite (**58/58**) plus a full six-requirement journey (**36 checks**). The one non-green line was a **test artifact, not a defect** — a follow-up profile call returned `401` because the earlier password change had (correctly) ended that session; a fresh-session re-check confirmed `newPassword`-without-`currentPassword` → `400`, empty body → `400`, email-only change → `200`.
+
+### Findings (non-blocking observations — nothing broken)
+- **Swap recipient consent** — the mobile mock shows the recipient a "Check & accept / Decline", but the implemented (and specified) flow gates only on **admin** approval; there is no recipient accept/decline endpoint. All specified behaviour works — noted in case recipient confirmation is wanted later.
+- **Availability path params** — `GET /availability/:year/:month` and `/submit` parse `year`/`month` with `Number(...)` and are not schema-validated; a non-numeric segment does **not** crash (returns a graceful non-`500`) but isn't the ideal clean `400`. Cosmetic.
+- **`POST /admin/availability/open` fans out to every active employee** — expected behaviour; noted because it created ~64 availability slots during testing (all removed afterward, DB left pristine).
+
+### No code or schema changes
+Pure verification + documentation. `API_Doc.md` gained a **User Site — Requirements Coverage** map (user-story → endpoint) and its Endpoint Summary now includes the schedule endpoints (**85 total**).
+
+### Endpoint count: unchanged — **85**.
+

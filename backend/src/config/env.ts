@@ -25,6 +25,16 @@ const envSchema = z.object({
 
   // Number of reverse proxies in front of the app (for correct client IPs).
   TRUST_PROXY_HOPS: z.coerce.number().int().min(0).default(1),
+
+  // Shift reminders (5h/3h/1h before start). CRON_SECRET guards the cron
+  // dispatch endpoint; the in-process scheduler runs the same dispatch on a
+  // long-lived server (disabled automatically on serverless — see server.ts).
+  CRON_SECRET: z.string().min(16).optional(),
+  REMINDER_INTERVAL_MIN: z.coerce.number().int().positive().default(15),
+  REMINDER_INPROCESS_CRON: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((v) => v === 'true'),
 });
 
 type EnvConfig = z.infer<typeof envSchema>;
@@ -63,6 +73,9 @@ const FALLBACK_ENV: EnvConfig = {
   RATE_LIMIT_MAX: 1000,
   AUTH_RATE_LIMIT_MAX: 20,
   TRUST_PROXY_HOPS: 1,
+  REMINDER_INTERVAL_MIN: 15,
+  // On a misconfigured server, do not auto-run the scheduler.
+  REMINDER_INPROCESS_CRON: false,
 };
 
 export const envConfig: EnvConfig = parsed.success ? parsed.data : FALLBACK_ENV;

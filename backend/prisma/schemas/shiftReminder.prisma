@@ -1,0 +1,16 @@
+// Idempotency ledger for shift reminders. One row per (confirmed shift, offset)
+// guarantees each reminder (5h / 3h / 1h before start) is sent exactly once,
+// even if the dispatcher runs concurrently or repeatedly. Cascades away if the
+// underlying confirmed response is removed (e.g. a shift swap).
+model ShiftReminder {
+  id                   String             @id @default(cuid())
+  shiftOfferResponseId String
+  shiftOfferResponse   ShiftOfferResponse @relation(fields: [shiftOfferResponseId], references: [id], onDelete: Cascade)
+  offsetMinutes        Int // 300 (5h) · 180 (3h) · 60 (1h)
+  notificationId       String?
+  sentAt               DateTime           @default(now())
+
+  @@unique([shiftOfferResponseId, offsetMinutes])
+  @@index([shiftOfferResponseId])
+  @@map("shift_reminders")
+}

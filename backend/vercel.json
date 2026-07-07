@@ -15,5 +15,11 @@
       "dest": "api/index.js"
     }
   ],
-  "regions": ["iad1"]
+  "regions": ["iad1"],
+  "crons": [
+    {
+      "path": "/api/v1/cron/reminders",
+      "schedule": "*/15 * * * *"
+    }
+  ]
 }

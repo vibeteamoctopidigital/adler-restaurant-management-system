@@ -69,7 +69,7 @@ Copy `.env.example` → `.env`. **Required:**
 | `REFRESH_TOKEN_SECRET` | ≥ 32 chars |
 | `CLIENT_URL` | Frontend origin, used by CORS (credentials mode) |
 
-**Optional** (sensible defaults applied if omitted): `PORT` (default 8000), `NODE_ENV`, `ACCESS_TOKEN_EXPIRES_IN`, `REFRESH_TOKEN_EXPIRES_IN`, `JWT_EXPIRES_IN`, `BCRYPT_SALT_ROUNDS`, `RATE_LIMIT_WINDOW_MS`, `RATE_LIMIT_MAX`, `AUTH_RATE_LIMIT_MAX`, `TRUST_PROXY_HOPS` (default 1), `LOG_LEVEL`.
+**Optional** (sensible defaults applied if omitted): `PORT` (default 8000), `NODE_ENV`, `ACCESS_TOKEN_EXPIRES_IN`, `REFRESH_TOKEN_EXPIRES_IN`, `JWT_EXPIRES_IN`, `BCRYPT_SALT_ROUNDS`, `RATE_LIMIT_WINDOW_MS`, `RATE_LIMIT_MAX`, `AUTH_RATE_LIMIT_MAX`, `TRUST_PROXY_HOPS` (default 1), `LOG_LEVEL`, `CRON_SECRET` (guards the reminder cron endpoint), `REMINDER_INTERVAL_MIN` (default 15), `REMINDER_INPROCESS_CRON` (default `true`; set `false` on serverless).
 
 > If the environment is invalid at boot, the app does **not** start serving with placeholder secrets — every request returns a clear `500` naming the offending variable.
 
@@ -159,6 +159,8 @@ After changing any `*.prisma` file, run `npm run migrate` (dev) to regenerate th
 **Admin** — auth · overview · employees (cursor-paginated) · categories (tree + sub-categories) · shifts (offer → notify → approvals) · shift swaps (approve = atomic exchange) · workload & demands (headcount planning) · reports (+ CSV) · settings (L‑GAV rules) · availability (open/status/grid/nudge) · **schedule publishing**.
 
 **Staff** — auth (+ change password) · shifts (accept/decline, auto-removed 1 min before start) · notifications · shift swaps (request/cancel) · availability (calendar submit) · **My Schedule** (confirmed shifts, sortable by day/week/month) · **My Hours** (own payroll hours for a month).
+
+**Shift reminders** — confirmed shifts trigger `SHIFT_REMINDER` notifications **5 h / 3 h / 1 h** before start, dispatched idempotently by a cron-triggered endpoint (`/cron/reminders`, guarded by `CRON_SECRET`; Vercel Cron configured every 15 min) or an in-process scheduler on a long-lived server. See `API_Doc.md` §21.
 
 See the **[User Site — Requirements Coverage](./API_Doc.md#user-site--requirements-coverage)** table in `API_Doc.md` for the user-story → endpoint map.
 

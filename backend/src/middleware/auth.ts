@@ -75,3 +75,30 @@ export const authorizeUser = (_req: Request, res: Response, next: NextFunction):
 
   next();
 };
+
+/**
+ * Authorize Cron — guards the scheduled dispatch endpoint. The scheduler
+ * (Vercel Cron / external) presents the shared secret as `Authorization:
+ * Bearer <CRON_SECRET>` or an `x-cron-secret` header. Rejects with 503 if no
+ * secret is configured, 401 if it doesn't match.
+ */
+export const authorizeCron = (req: Request, res: Response, next: NextFunction): void => {
+  const secret = envConfig.CRON_SECRET;
+  if (!secret) {
+    sendError(res, { statusCode: 503, message: "Cron is not configured on this server." });
+    return;
+  }
+
+  const header = req.headers.authorization;
+  const provided =
+    header && header.startsWith("Bearer ")
+      ? header.slice("Bearer ".length).trim()
+      : (req.headers["x-cron-secret"] as string | undefined);
+
+  if (provided !== secret) {
+    sendError(res, { statusCode: 401, message: "Invalid cron credentials." });
+    return;
+  }
+
+  next();
+};

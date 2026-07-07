@@ -13,6 +13,8 @@ import settingsRouter from "../modules/admin/settings/settings.route";
 import adminSwapRouter from "../modules/admin/swaps/swaps.route";
 import adminAvailabilityRouter from "../modules/admin/availability/availability.route";
 import adminScheduleRouter from "../modules/admin/schedule/schedule.route";
+import adminReminderRouter from "../modules/reminders/reminders.admin.route";
+import cronReminderRouter from "../modules/reminders/reminders.cron.route";
 
 // ── Staff (user) feature routers ───────────────────────────────────
 import userAuthRouter from "../modules/user/auth/auth.route";
@@ -41,6 +43,7 @@ indexRouter.use("/admin/settings", settingsRouter);
 indexRouter.use("/admin/swaps", adminSwapRouter);
 indexRouter.use("/admin/availability", adminAvailabilityRouter);
 indexRouter.use("/admin/schedule", adminScheduleRouter);
+indexRouter.use("/admin/reminders", adminReminderRouter);
 
 // ── Staff (mobile) ─────────────────────────────────────────────────
 indexRouter.use("/shifts", userShiftRouter);
@@ -49,5 +52,8 @@ indexRouter.use("/swaps", userSwapRouter);
 indexRouter.use("/availability", userAvailabilityRouter);
 indexRouter.use("/schedule", userScheduleRouter);
 indexRouter.use("/hours", userHoursRouter);
+
+// ── Scheduled jobs (cron-triggered) ────────────────────────────────
+indexRouter.use("/cron/reminders", cronReminderRouter);
 
 export default indexRouter;

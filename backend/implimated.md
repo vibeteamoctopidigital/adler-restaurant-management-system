@@ -716,3 +716,40 @@ No schema change. Mounted `userHoursRouter` at `/hours` in `routes/index.route.t
 ### New Endpoint Count (this iteration)
 **1 new endpoint** (`GET /hours`). **Total project endpoints: 86.**
 
+## 24. Shift Reminders — 5h / 3h / 1h Before a Shift
+
+Employees now get automatic reminder notifications **5 hours, 3 hours, and 1 hour** before each confirmed shift starts. A "confirmed shift" is a shift offer the employee is admin-**APPROVED** for; the reminder is delivered as an in-app `Notification` (`type: SHIFT_REMINDER`) read via the normal notifications API — no new staff endpoint.
+
+### Design — a cron-triggered, idempotent dispatcher (serverless-safe)
+This is time-based work, and the app deploys to Vercel serverless (no always-on worker). So instead of a fragile in-process timer or a delayed-job queue (which would need a persistent Redis + worker), a **dispatch endpoint** is scanned periodically by a scheduler; each run sends the reminders that have just become due.
+- **Exactly-once delivery:** a new `ShiftReminder` ledger table with `@@unique([shiftOfferResponseId, offsetMinutes])`. The unique row is the idempotency guard — overlapping/retried dispatch runs can't double-send (a duplicate insert throws `P2002` and is skipped). Rows cascade away if the confirmed response is removed (e.g. a shift swap).
+- **No stale bursts:** a reminder only sends within a **20-minute catch-up window** after it becomes due. So a shift confirmed *late* (e.g. 2h before start) silently skips its already-past 5h/3h reminders and only fires the still-relevant 1h; and a long dispatcher outage won't unleash a backlog of stale reminders. The window comfortably covers one missed 15-min run.
+- **Triggering:** Vercel Cron config added (`*/15 * * * *` → `/api/v1/cron/reminders`); on a long-lived/self-hosted server an **in-process scheduler** runs the same dispatch automatically (guarded so it never runs on serverless — only `server.ts` starts it, never `vercel.ts`).
+
+### Schema (`prisma/schemas/`)
+- **New enum value** `NotificationType.SHIFT_REMINDER`.
+- **New model** `ShiftReminder` (`shiftReminder.prisma`): `(shiftOfferResponseId, offsetMinutes)` unique, `notificationId?`, `sentAt`. Back-relation `reminders` added on `ShiftOfferResponse`. Regenerated client + `db push` (**additive**).
+
+### Config (`src/config/env.ts`, `.env.example`)
+- `CRON_SECRET` (≥16 chars, optional) — guards the cron endpoint.
+- `REMINDER_INTERVAL_MIN` (default 15) — in-process scheduler cadence.
+- `REMINDER_INPROCESS_CRON` (default `true`) — run the dispatcher in-process on a persistent server.
+
+### Module (`src/modules/reminders/`)
+| File | Purpose |
+|------|---------|
+| `reminders.service.ts` | `dispatchDueReminders({ now? })` (the scan + idempotent send), `listUpcoming(withinHours)`, and `startReminderScheduler()` |
+| `reminders.controller.ts` | `cronDispatch`, `adminDispatch`, `adminUpcoming` |
+| `reminders.validation.ts` | `dispatchSchema` (optional `at` override), `upcomingQuerySchema` |
+| `reminders.cron.route.ts` | `GET`/`POST /` → `authorizeCron` (secret) → dispatch. Mounted at `/cron/reminders` |
+| `reminders.admin.route.ts` | `POST /dispatch`, `GET /upcoming` (admin-guarded). Mounted at `/admin/reminders` |
+
+New `authorizeCron` middleware (checks `Authorization: Bearer <CRON_SECRET>` / `x-cron-secret`; `503` if unconfigured, `401` if wrong). Admin `POST /dispatch` accepts an optional `at` (ISO) override of "now" for testing/backfill.
+
+### Verification
+- `npx tsc --noEmit` → **0 errors**.
+- **E2E against the live DB (20/20)**: seeded a confirmed shift **S** (start 18:00) + an employee → drove dispatch with the `at` override at **T-5h → sends the 5h reminder**, again → **0 (idempotent)**, **T-3h → 3h**, **T-1h → 1h**, **T-10m → 0** → the employee's `GET /notifications` shows **exactly 3 `SHIFT_REMINDER`s** (offsets 300/180/60, bodies "5/3/1 hours"), backed by **3 ledger rows** → a **late-confirmed** shift **S2** dispatched at T2-90m sends **0** (5h/3h stale, 1h not due) and at T2-50m sends **only the 1h** → admin `/upcoming` reflects the per-offset sent state → cron auth: no/wrong secret `401`, correct secret `200` → admin dispatch guards: no-auth `401`, staff token `403`, bad `at` `400`. All test data cleaned up.
+
+### New Endpoint Count (this iteration)
+**3 new endpoints** (1 cron dispatch + 2 admin: dispatch, upcoming). **Total project endpoints: 89.**
+

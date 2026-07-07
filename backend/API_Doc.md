@@ -164,8 +164,9 @@ Each file's role: **`*.route.ts`** wires paths + guards + validation → **`*.co
 18. [Admin — Schedule Publishing](#18-admin--schedule-publishing)
 19. [Staff — My Schedule](#19-staff--my-schedule)
 20. [Staff — My Hours](#20-staff--my-hours)
-21. [Enum Reference](#21-enum-reference)
-22. [Seed Script](#22-seed-script)
+21. [Shift Reminders](#21-shift-reminders)
+22. [Enum Reference](#22-enum-reference)
+23. [Seed Script](#23-seed-script)
 - 📱 [User Side Doc](#user-side-doc) — staff / React Native mobile API
 - 🧭 [User Site — Requirements Coverage](#user-site--requirements-coverage) — staff user-story → endpoint map
 
@@ -184,6 +185,7 @@ The staff (React Native) user site fulfils six user stories. Each maps to the en
 | 5 | See the published schedule, sortable by date / week / month | `GET /schedule?view=day\|week\|month`, `GET /schedule/months` (§19) | `POST /admin/schedule/publish` \| `unpublish`, `GET /admin/schedule` (§18) | Confirmed shifts are visible **only after the month is published**; drafts stay hidden ("not published yet"). |
 | 6 | Accept/reject posted jobs; jobs auto-removed 1 min before start | `GET /shifts`, `GET /shifts/:shiftId`, `POST /shifts/:shiftId/respond` (§14) | `POST /admin/shifts` + `/notify` (§6) | A job leaves the staff app **within 1 minute** of its start (query-time cutoff: list omits it, `GET`→`404`, respond→`409`). Never deleted — the admin still sees it. |
 | + | See own hours for payroll (Hours tab) | `GET /hours?year=&month=` (§20) | hours derive from admin approvals (§7) | Own worked-so-far vs. scheduled vs. contracted target + per-shift breakdown. |
+| + | Reminder notifications 5 h / 3 h / 1 h before a shift | arrives in `GET /notifications` as `SHIFT_REMINDER` (§15) | scheduler → `/cron/reminders`; admin `/admin/reminders/*` (§21) | Idempotent dispatch; late-confirmed shifts only get still-relevant reminders. |
 
 ---
 
@@ -1098,7 +1100,42 @@ Base path `/hours`. Staff-guarded (mobile app). An employee's own **hours for pa
 
 ---
 
-## 21. Enum Reference
+## 21. Shift Reminders
+Confirmed shifts trigger automatic reminder notifications **5 hours, 3 hours, and 1 hour** before the shift's `startTime`. A "confirmed shift" is a shift offer the employee is admin-**APPROVED** for (§7). Each reminder is delivered as an in-app `Notification` (`type: SHIFT_REMINDER`) that the employee reads via the normal notifications API (§15) — the mobile app just shows it.
+
+**How it fires (serverless-safe).** A scheduler calls the dispatch endpoint periodically (Vercel Cron is configured for every 15 min); each run scans confirmed shifts starting within 5 hours and sends any reminder that has just become due. Delivery is **idempotent** — a `shift_reminders` ledger row per `(confirmed shift, offset)` guarantees each reminder is sent **exactly once**, even across overlapping/retried runs. A shift confirmed *late* (e.g. 2 h before start) silently skips its already-past 5 h/3 h reminders and only fires the still-relevant ones. On a long-lived (self-hosted) server an in-process scheduler runs the same dispatch automatically (`REMINDER_INPROCESS_CRON=true`).
+
+### `GET|POST http://localhost:8000/api/v1/cron/reminders`  · scheduler-triggered dispatch
+Guarded by the shared **`CRON_SECRET`** (sent as `Authorization: Bearer <CRON_SECRET>` or an `x-cron-secret` header) — **not** JWT. Vercel Cron adds the header automatically. Scans and sends all due reminders.
+```json
+{ "success": true, "message": "Dispatched 3 reminder(s).",
+  "data": { "at": "2026-07-10T13:00:00.000Z", "scannedResponses": 8, "sent": 3,
+            "byOffset": { "300": 1, "180": 1, "60": 1 } } }
+```
+Errors: `503` if `CRON_SECRET` isn't configured · `401` if the secret is missing/wrong.
+
+### `POST http://localhost:8000/api/v1/admin/reminders/dispatch`  · admin manual dispatch
+Admin-guarded. Same dispatch, on demand (useful for testing or backfilling a missed window). Optional body `{ "at": "<ISO date-time>" }` overrides "now" (admin-only). `200` → same payload as above.
+
+### `GET http://localhost:8000/api/v1/admin/reminders/upcoming?withinHours=24`  · admin visibility
+Admin-guarded. Upcoming confirmed shifts (default next 24 h, max 168) with each shift's per-offset reminder status.
+```json
+{ "success": true, "data": { "upcoming": [
+    { "responseId": "…",
+      "user": { "id": "…", "name": "Anna Müller", "email": "…" },
+      "shift": { "id": "…", "jobTitle": "Evening Waiter", "category": "Service", "startTime": "…" },
+      "reminders": [
+        { "offsetMinutes": 300, "hoursBefore": 5, "sent": true,  "sentAt": "…" },
+        { "offsetMinutes": 180, "hoursBefore": 3, "sent": false, "sentAt": null },
+        { "offsetMinutes": 60,  "hoursBefore": 1, "sent": false, "sentAt": null }
+      ] } ] } }
+```
+
+> **Staff side:** there is no separate staff endpoint — reminders arrive as notifications. In `GET /notifications` (§15) they appear with `type: "SHIFT_REMINDER"`, a body like *"Your shift \"Evening Waiter\" (Service) starts in 5 hours."*, and `payload: { shiftOfferId, offsetMinutes, hoursBefore, startTime }`.
+
+---
+
+## 22. Enum Reference
 
 | Enum | Values |
 |------|--------|
@@ -1111,13 +1148,13 @@ Base path `/hours`. Staff-guarded (mobile app). An employee's own **hours for pa
 | `PlanStatus` (workload week) | `DRAFT`, `SUBMITTED`, `PUBLISHED` |
 | `DemandWeekStatus` (demands week) | `DRAFT`, `PUBLISHED` |
 | `SchedulePublicationStatus` (month publish gate) | `DRAFT`, `PUBLISHED` |
-| `NotificationType` | `SHIFT_OFFER_PUBLISHED`, `SHIFT_CHANGED`, `SWAP_REQUEST_RECEIVED`, `SWAP_REQUEST_RESULT`, `WEEKLY_SHIFTS_PUBLISHED`, `AVAILABILITY_REMINDER`, `RULE_VIOLATION`, `GENERAL` |
+| `NotificationType` | `SHIFT_OFFER_PUBLISHED`, `SHIFT_REMINDER`, `SHIFT_CHANGED`, `SWAP_REQUEST_RECEIVED`, `SWAP_REQUEST_RESULT`, `WEEKLY_SHIFTS_PUBLISHED`, `AVAILABILITY_REMINDER`, `RULE_VIOLATION`, `GENERAL` |
 | `NotificationChannel` | `PUSH`, `EMAIL`, `IN_APP` |
 | `NotificationStatus` | `PENDING`, `SENT`, `FAILED`, `READ` |
 
 ---
 
-## 22. Seed Script
+## 23. Seed Script
 
 Create the default admin (idempotent):
 ```bash
@@ -1253,6 +1290,7 @@ The admin then **approves/rejects** on `/api/v1/admin/swaps` (§8). On **approve
 | Staff — Availability | 4 |
 | Staff — My Schedule | 2 |
 | Staff — My Hours | 1 |
-| **Total** | **86** |
+| Shift Reminders (cron + admin) | 3 |
+| **Total** | **89** |
 
 > **Not yet implemented (deferred scheduling engine):** the weekly-plan **auto-generation** ("Manage Plans") — automatically turning demand + submitted availability into a rule-compliant proposed roster, with hand-adjustment and per-change L-GAV feedback. The demand side is now built two ways — the day-level **Demands** grid (§10, `DemandWeek` / `DayDemand`) and the shift-slot **Workload** layer (§9, `WeeklyPlan` / `StaffingDemand`) — and employee **availability collection** too (§13 & §17); what remains is only the constraint-solving/roster-generation engine that consumes them. Also open (not blocking): "open to the whole team" swaps (current swaps are targeted) and actual clock-in/out worked-hours capture (reports currently derive hours from approved shifts). Tracked in `implimated.md`.

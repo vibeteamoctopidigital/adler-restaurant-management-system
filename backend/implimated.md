@@ -689,3 +689,30 @@ Pure verification + documentation. `API_Doc.md` gained a **User Site — Require
 
 ### Endpoint count: unchanged — **85**.
 
+## 23. Staff **My Hours** — Payroll Hours Endpoint
+
+Closed the clearest gap surfaced by the feature review: the mobile app has a **Hours** tab ("My hours · for payroll"), but there was no staff-facing hours endpoint — Reports (§11) were admin-only, and `modules/user/` had no hours module. Added a self-scoped payroll-hours endpoint so the 4th mobile tab has a backend.
+
+### Design — reuse the Reports hours semantics, scoped to the caller
+- Hours derive from the caller's admin-**APPROVED** `ShiftOfferResponse`s whose `ShiftOffer.startTime` falls in the month — **identical source to the admin Reports engine**, so a staff member and the admin always agree on the numbers.
+- Adds the **per-shift breakdown** the screen needs (the Reports engine only aggregates): each confirmed shift with its `hours` and a `completed` flag (its end time has passed).
+- **`workedHours`** = completed shifts only (the "July so far" figure); **`scheduledHours`** = all confirmed shifts in the month; **`targetHours`** = `contractedHoursMonthly` ("Target 100%"), with `overtimeHours`/`remainingHours` computed against it. `estimatedEarnings` is the caller's **own** estimate (hourly by worked hours, salaried by fixed salary).
+- **Not gated** by schedule publication — these are payroll hours for shifts the admin already confirmed, independent of whether the forward schedule view is published.
+
+### Module (`src/modules/user/hours/`, `/api/v1/hours`) — staff-guarded
+| File | Purpose |
+|------|---------|
+| `hours.validation.ts` | `hoursQuerySchema` — optional `year`/`month` (default current month) |
+| `hours.service.ts` | `getMyHours` — the month query + worked/scheduled/target/earnings computation |
+| `hours.controller.ts` | thin HTTP wrapper |
+| `hours.route.ts` | `GET /` (`authenticate` + `authorizeUser`) |
+
+No schema change. Mounted `userHoursRouter` at `/hours` in `routes/index.route.ts`.
+
+### Verification
+- `npx tsc --noEmit` → **0 errors** (strict mode).
+- **E2E against the live DB (17/17)**: seeded (via Prisma, for time control) a user (`contractedHoursMonthly=168`, `hourlyRate=28`) with a **completed** July shift (6h), an **upcoming** July shift (4.5h), and an August shift → logged in via the API (Bearer) → `GET /hours?year=2026&month=7` returned `scheduledHours=10.5`, `workedHours=6` (completed only), `targetHours=168`, `remainingHours=157.5`, `overtimeHours=0`, `estimatedEarnings=168` (6×28), 2 shifts ordered past-first with correct `completed` flags and per-shift hours, **August excluded** → no-params defaults to the current month → guards: no-auth `401`, bad month `400`. All test data cleaned up.
+
+### New Endpoint Count (this iteration)
+**1 new endpoint** (`GET /hours`). **Total project endpoints: 86.**
+

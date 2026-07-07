@@ -5,8 +5,6 @@ import bcrypt from 'bcrypt';
 const prisma = new PrismaClient();
 
 async function main() {
-  console.log('Start seeding...');
-  
   const passwordHash = await bcrypt.hash('password123', 10);
 
   // 1. Create Categories (Roles/Departments)
@@ -21,7 +19,6 @@ async function main() {
     }
     categories.push(category);
   }
-  console.log(`Ensured ${categories.length} categories.`);
 
   // 2. Create Admins
   const adminEmails = ['admin1@test.com', 'admin2@test.com'];
@@ -41,7 +38,6 @@ async function main() {
     });
     admins.push(admin);
   }
-  console.log(`Ensured ${admins.length} mock admins.`);
 
   // 3. Create Users
   const users = [];
@@ -96,7 +92,6 @@ async function main() {
       });
     }
   }
-  console.log(`Ensured ${users.length} mock users.`);
 
   // 4. Create Weekly Plans & Shifts
   const currentYear = new Date().getFullYear();
@@ -170,7 +165,6 @@ async function main() {
         },
       });
     }
-    console.log(`Generated Weekly Plan (Week ${planData.weekNumber}) with mock shifts.`);
   }
 
   // 6. Notifications (just adding a few for random users)
@@ -187,9 +181,6 @@ async function main() {
       },
     });
   }
-  console.log(`Generated 10 mock notifications.`);
-
-  console.log('Seeding finished.');
 }
 
 main()

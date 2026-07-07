@@ -163,8 +163,9 @@ Each file's role: **`*.route.ts`** wires paths + guards + validation → **`*.co
 17. [Staff — Availability](#17-staff--availability)
 18. [Admin — Schedule Publishing](#18-admin--schedule-publishing)
 19. [Staff — My Schedule](#19-staff--my-schedule)
-20. [Enum Reference](#20-enum-reference)
-21. [Seed Script](#21-seed-script)
+20. [Staff — My Hours](#20-staff--my-hours)
+21. [Enum Reference](#21-enum-reference)
+22. [Seed Script](#22-seed-script)
 - 📱 [User Side Doc](#user-side-doc) — staff / React Native mobile API
 - 🧭 [User Site — Requirements Coverage](#user-site--requirements-coverage) — staff user-story → endpoint map
 
@@ -182,6 +183,7 @@ The staff (React Native) user site fulfils six user stories. Each maps to the en
 | 4 | Request a shift swap → admin approves → both sides updated | `POST /swaps`, `GET /swaps`, `POST /swaps/:swapId/cancel` (§16) | `GET /admin/swaps`, `POST /admin/swaps/:swapId/approve` \| `reject` (§8) | Approval **atomically exchanges** the two confirmed shifts and notifies both employees (`SWAP_REQUEST_RESULT`). |
 | 5 | See the published schedule, sortable by date / week / month | `GET /schedule?view=day\|week\|month`, `GET /schedule/months` (§19) | `POST /admin/schedule/publish` \| `unpublish`, `GET /admin/schedule` (§18) | Confirmed shifts are visible **only after the month is published**; drafts stay hidden ("not published yet"). |
 | 6 | Accept/reject posted jobs; jobs auto-removed 1 min before start | `GET /shifts`, `GET /shifts/:shiftId`, `POST /shifts/:shiftId/respond` (§14) | `POST /admin/shifts` + `/notify` (§6) | A job leaves the staff app **within 1 minute** of its start (query-time cutoff: list omits it, `GET`→`404`, respond→`409`). Never deleted — the admin still sees it. |
+| + | See own hours for payroll (Hours tab) | `GET /hours?year=&month=` (§20) | hours derive from admin approvals (§7) | Own worked-so-far vs. scheduled vs. contracted target + per-shift breakdown. |
 
 ---
 
@@ -1063,7 +1065,40 @@ Published months only, newest-first — for the app's month picker.
 
 ---
 
-## 20. Enum Reference
+## 20. Staff — My Hours
+Base path `/hours`. Staff-guarded (mobile app). An employee's own **hours for payroll** for a month — the mobile **Hours** tab. Hours come from the employee's admin-**APPROVED** shift-offer acceptances that fall in the month (same source as the admin Reports, scoped to the caller). There is no separate time-clock yet, so a shift's hours are its scheduled duration; a shift counts as **worked** once it has ended.
+
+### `GET http://localhost:8000/api/v1/hours?year=2026&month=7`  · my hours for a month
+`year`/`month` are optional and default to the **current month**.
+```json
+{ "success": true, "message": "Hours fetched successfully.", "data": {
+    "period": { "year": 2026, "month": 7, "label": "July 2026" },
+    "summary": {
+      "workedHours": 24.2,        // completed shifts so far (ended)
+      "scheduledHours": 30.9,     // all confirmed shifts this month
+      "targetHours": 182,         // contracted hours ("Target 100%")
+      "workloadPercent": 100,
+      "overtimeHours": 0,         // max(0, scheduled − target)
+      "remainingHours": 151.1,    // max(0, target − scheduled)  (null if no contract)
+      "shiftCount": 4,
+      "contractType": "HOURLY",
+      "hourlyRate": 28,
+      "estimatedEarnings": 677.6  // own-data estimate: workedHours × hourlyRate (or fixed salary)
+    },
+    "shifts": [
+      { "id": "…", "jobTitle": "Evening", "category": { "id": "…", "name": "Service" },
+        "startTime": "2026-07-01T17:00:00.000Z", "endTime": "2026-07-01T23:42:00.000Z",
+        "hours": 6.7, "hourlyPrice": "28", "completed": true, "confirmedAt": "…" }
+    ] } }
+```
+- `shifts` are ordered by `startTime`; each has a `completed` flag (its end time has passed).
+- `workedHours` sums only **completed** shifts (the "July so far" figure); `scheduledHours` sums all confirmed shifts in the month.
+- `targetHours` is the caller's `contractedHoursMonthly` (`null` if not set); `remainingHours`/`overtimeHours` are computed against it.
+- `estimatedEarnings` is the caller's **own** estimate (hourly staff by worked hours, salaried by fixed salary), `null` if neither rate is set.
+
+---
+
+## 21. Enum Reference
 
 | Enum | Values |
 |------|--------|
@@ -1082,7 +1117,7 @@ Published months only, newest-first — for the app's month picker.
 
 ---
 
-## 21. Seed Script
+## 22. Seed Script
 
 Create the default admin (idempotent):
 ```bash
@@ -1217,6 +1252,7 @@ The admin then **approves/rejects** on `/api/v1/admin/swaps` (§8). On **approve
 | Staff — Shift Swaps | 3 |
 | Staff — Availability | 4 |
 | Staff — My Schedule | 2 |
-| **Total** | **85** |
+| Staff — My Hours | 1 |
+| **Total** | **86** |
 
 > **Not yet implemented (deferred scheduling engine):** the weekly-plan **auto-generation** ("Manage Plans") — automatically turning demand + submitted availability into a rule-compliant proposed roster, with hand-adjustment and per-change L-GAV feedback. The demand side is now built two ways — the day-level **Demands** grid (§10, `DemandWeek` / `DayDemand`) and the shift-slot **Workload** layer (§9, `WeeklyPlan` / `StaffingDemand`) — and employee **availability collection** too (§13 & §17); what remains is only the constraint-solving/roster-generation engine that consumes them. Also open (not blocking): "open to the whole team" swaps (current swaps are targeted) and actual clock-in/out worked-hours capture (reports currently derive hours from approved shifts). Tracked in `implimated.md`.

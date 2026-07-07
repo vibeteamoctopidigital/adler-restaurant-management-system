@@ -158,7 +158,7 @@ After changing any `*.prisma` file, run `npm run migrate` (dev) to regenerate th
 
 **Admin** — auth · overview · employees (cursor-paginated) · categories (tree + sub-categories) · shifts (offer → notify → approvals) · shift swaps (approve = atomic exchange) · workload & demands (headcount planning) · reports (+ CSV) · settings (L‑GAV rules) · availability (open/status/grid/nudge) · **schedule publishing**.
 
-**Staff** — auth (+ change password) · shifts (accept/decline, auto-removed 1 min before start) · notifications · shift swaps (request/cancel) · availability (calendar submit) · **My Schedule** (confirmed shifts, sortable by day/week/month).
+**Staff** — auth (+ change password) · shifts (accept/decline, auto-removed 1 min before start) · notifications · shift swaps (request/cancel) · availability (calendar submit) · **My Schedule** (confirmed shifts, sortable by day/week/month) · **My Hours** (own payroll hours for a month).
 
 See the **[User Site — Requirements Coverage](./API_Doc.md#user-site--requirements-coverage)** table in `API_Doc.md` for the user-story → endpoint map.
 

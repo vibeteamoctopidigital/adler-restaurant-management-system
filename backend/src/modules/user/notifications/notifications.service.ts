@@ -15,7 +15,7 @@ const notificationSelect = {
   createdAt: true,
 } satisfies Prisma.NotificationSelect;
 
-// ─── List Notifications ──────────────────────────────────────────
+// ─── List Notifications ─────────────
 const listNotifications = async (
   userId: string,
   query: { page: number; limit: number; unreadOnly?: boolean }

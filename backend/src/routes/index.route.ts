@@ -21,6 +21,7 @@ import notificationRouter from "../modules/user/notifications/notifications.rout
 import userSwapRouter from "../modules/user/swaps/swaps.route";
 import userAvailabilityRouter from "../modules/user/availability/availability.route";
 import userScheduleRouter from "../modules/user/schedule/schedule.route";
+import userHoursRouter from "../modules/user/hours/hours.route";
 
 const indexRouter = Router();
 
@@ -47,5 +48,6 @@ indexRouter.use("/notifications", notificationRouter);
 indexRouter.use("/swaps", userSwapRouter);
 indexRouter.use("/availability", userAvailabilityRouter);
 indexRouter.use("/schedule", userScheduleRouter);
+indexRouter.use("/hours", userHoursRouter);
 
 export default indexRouter;

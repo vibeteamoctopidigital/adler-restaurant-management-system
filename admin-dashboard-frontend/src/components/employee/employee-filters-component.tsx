@@ -13,15 +13,15 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { DEPARTMENTS, EMPLOYEE_STATUSES } from '@/lib/employee-utilities';
+import { DEPARTMENTS } from '@/lib/employee-utilities';
 
 interface EmployeeFiltersProps {
   searchQuery: string;
   onSearchChange: (query: string) => void;
   departmentFilter: string;
   onDepartmentChange: (dept: string) => void;
-  statusFilter: string;
-  onStatusChange: (status: string) => void;
+  isActiveFilter: string;
+  onIsActiveChange: (isActive: string) => void;
   isFetching: boolean;
 }
 
@@ -30,8 +30,8 @@ export function EmployeeFilters({
   onSearchChange,
   departmentFilter,
   onDepartmentChange,
-  statusFilter,
-  onStatusChange,
+  isActiveFilter,
+  onIsActiveChange,
   isFetching,
 }: EmployeeFiltersProps) {
   return (
@@ -65,17 +65,14 @@ export function EmployeeFilters({
         </Select>
 
         {/* Status Filter */}
-        <Select value={statusFilter} onValueChange={onStatusChange} disabled={isFetching}>
+        <Select value={isActiveFilter} onValueChange={onIsActiveChange} disabled={isFetching}>
           <SelectTrigger className="rounded-lg border-slate-200 bg-slate-50/50 focus:bg-white focus:border-blue-300 transition-all w-full sm:w-[160px]">
             <SelectValue placeholder="Status" />
           </SelectTrigger>
           <SelectContent className="rounded-xl border-slate-200 shadow-lg">
             <SelectItem value="all">All Status</SelectItem>
-            {EMPLOYEE_STATUSES.map((status) => (
-              <SelectItem key={status} value={status}>
-                {status}
-              </SelectItem>
-            ))}
+            <SelectItem value="true">Active</SelectItem>
+            <SelectItem value="false">Inactive</SelectItem>
           </SelectContent>
         </Select>
 

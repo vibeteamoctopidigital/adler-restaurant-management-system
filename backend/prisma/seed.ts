@@ -1,194 +1,285 @@
-import { PrismaClient, EmployeeType, ContractType, ShiftStatus, PlanStatus, NotificationType, NotificationChannel } from '../src/generated/prisma/client.js';
-import { faker } from '@faker-js/faker';
+
+import { PrismaClient } from '../src/generated/prisma/client.js';
 import bcrypt from 'bcrypt';
 
 const prisma = new PrismaClient();
 
 async function main() {
-  const passwordHash = await bcrypt.hash('password123', 10);
+  console.log('Starting seed...');
 
-  // 1. Create Categories (Roles/Departments)
-  const categoryNames = ['Chef', 'Waiter', 'Bartender', 'Manager', 'Dishwasher'];
-  const categories = [];
-  for (const name of categoryNames) {
-    let category = await prisma.category.findFirst({ where: { name } });
-    if (!category) {
-      category = await prisma.category.create({
+  // Clean up existing data to avoid conflicts
+await prisma.$transaction(async (tx) => {
+  await tx.dayDemand.deleteMany({});
+  await tx.demandWeek.deleteMany({});
+  await tx.availabilityDay.deleteMany({});
+  await tx.availabilityMonth.deleteMany({});
+  // await tx.shiftAssignment.deleteMany({});
+  await tx.shift.deleteMany({});
+
+  await tx.userCategory.deleteMany({});
+
+  // await tx.category.deleteMany({});
+
+  await tx.user.deleteMany({});
+});
+
+  // 1. Create Categories
+  console.log('Creating categories...');
+  const categoryNames = ['Service', 'Kitchen', 'Bar', 'Management'];
+  const categories = await Promise.all(
+    categoryNames.map((name) =>
+      prisma.category.create({
         data: { name },
-      });
-    }
-    categories.push(category);
-  }
+      })
+    )
+  );
 
-  // 2. Create Admins
-  const adminEmails = ['admin1@test.com', 'admin2@test.com'];
-  const admins = [];
-  for (const email of adminEmails) {
-    const admin = await prisma.admin.upsert({
-      where: { email },
-      update: {},
-      create: {
-        email,
-        passwordHash,
-        firstName: faker.person.firstName(),
-        lastName: faker.person.lastName(),
-        name: faker.person.fullName(),
-        isActive: true,
-      },
-    });
-    admins.push(admin);
-  }
+  const serviceCategory = categories.find((c) => c.name === 'Service')!;
+  const kitchenCategory = categories.find((c) => c.name === 'Kitchen')!;
 
-  // 3. Create Users
-  const users = [];
-  for (let i = 0; i < 20; i++) {
-    const firstName = faker.person.firstName();
-    const lastName = faker.person.lastName();
-    const email = faker.internet.email({ firstName, lastName, provider: 'test.com' });
-    
-    // Check if user exists
-    let user = await prisma.user.findUnique({ where: { email } });
-    if (!user) {
-      const contractType = faker.helpers.arrayElement([ContractType.HOURLY, ContractType.MONTHLY_SALARY, ContractType.WORKLOAD_PERCENT]);
-      user = await prisma.user.create({
+  // 2. Create Users
+  console.log('Creating users...');
+  const passwordHash = await bcrypt.hash('password123', 10);
+  
+const usersData = [
+  {
+    firstName: "James",
+    lastName: "Anderson",
+    email: "james.anderson@example.com",
+    category: serviceCategory,
+  },
+  {
+    firstName: "Emily",
+    lastName: "Johnson",
+    email: "emily.johnson@example.com",
+    category: kitchenCategory,
+  },
+  {
+    firstName: "Michael",
+    lastName: "Williams",
+    email: "michael.williams@example.com",
+    category: serviceCategory,
+  },
+  {
+    firstName: "Olivia",
+    lastName: "Brown",
+    email: "olivia.brown@example.com",
+    category: kitchenCategory,
+  },
+  {
+    firstName: "William",
+    lastName: "Jones",
+    email: "william.jones@example.com",
+    category: serviceCategory,
+  },
+  {
+    firstName: "Sophia",
+    lastName: "Garcia",
+    email: "sophia.garcia@example.com",
+    category: kitchenCategory,
+  },
+  {
+    firstName: "Benjamin",
+    lastName: "Miller",
+    email: "benjamin.miller@example.com",
+    category: serviceCategory,
+  },
+  {
+    firstName: "Ava",
+    lastName: "Davis",
+    email: "ava.davis@example.com",
+    category: kitchenCategory,
+  },
+  {
+    firstName: "Lucas",
+    lastName: "Rodriguez",
+    email: "lucas.rodriguez@example.com",
+    category: serviceCategory,
+  },
+  {
+    firstName: "Charlotte",
+    lastName: "Martinez",
+    email: "charlotte.martinez@example.com",
+    category: kitchenCategory,
+  },
+  {
+    firstName: "Henry",
+    lastName: "Wilson",
+    email: "henry.wilson@example.com",
+    category: serviceCategory,
+  },
+  {
+    firstName: "Amelia",
+    lastName: "Moore",
+    email: "amelia.moore@example.com",
+    category: kitchenCategory,
+  },
+  {
+    firstName: "Daniel",
+    lastName: "Taylor",
+    email: "daniel.taylor@example.com",
+    category: serviceCategory,
+  },
+  {
+    firstName: "Harper",
+    lastName: "Thomas",
+    email: "harper.thomas@example.com",
+    category: kitchenCategory,
+  },
+  {
+    firstName: "Ethan",
+    lastName: "White",
+    email: "ethan.white@example.com",
+    category: serviceCategory,
+  },
+];
+
+  const users = await Promise.all(
+    usersData.map((u) =>
+      prisma.user.create({
         data: {
-          email,
+          firstName: u.firstName,
+          lastName: u.lastName,
+          name: `${u.firstName} ${u.lastName}`,
+          email: u.email,
           passwordHash,
-          firstName,
-          lastName,
-          name: `${firstName} ${lastName}`,
-          phone: faker.phone.number(),
-          address: faker.location.streetAddress(),
-          department: faker.helpers.arrayElement(['Kitchen', 'Front of House', 'Bar', 'Management']),
-          designation: faker.person.jobTitle(),
-          employeeType: faker.helpers.arrayElement([EmployeeType.FULL_TIME, EmployeeType.PART_TIME]),
-          contractType,
-          hourlyRate: faker.number.int({ min: 15, max: 35 }),
-          monthlySalary: contractType === ContractType.MONTHLY_SALARY ? faker.number.int({ min: 3000, max: 6000 }) : null,
-          contractedHoursMonthly: contractType !== ContractType.HOURLY ? faker.number.int({ min: 80, max: 160 }) : null,
           isActive: true,
           mustChangePassword: false,
+          categories: {
+            create: [
+              {
+                category: { connect: { id: u.category.id } }
+              }
+            ]
+          }
         },
-      });
-    }
-    users.push(user);
-    
-    // Link to categories
-    const userCategoriesCount = faker.number.int({ min: 1, max: 2 });
-    const assignedCategories = faker.helpers.arrayElements(categories, userCategoriesCount);
-    for (const cat of assignedCategories) {
-      await prisma.userCategory.upsert({
-        where: {
-          userId_categoryId: {
-            userId: user.id,
-            categoryId: cat.id,
-          },
-        },
-        update: {},
-        create: {
-          userId: user.id,
-          categoryId: cat.id,
-        },
-      });
-    }
-  }
+      })
+    )
+  );
 
-  // 4. Create Weekly Plans & Shifts
-  const currentYear = new Date().getFullYear();
-  const currentMonth = new Date().getMonth() + 1; // 1-12
-  
-  const plansToCreate = [
-    { year: currentYear, month: currentMonth, weekNumber: 1, status: PlanStatus.PUBLISHED },
-    { year: currentYear, month: currentMonth, weekNumber: 2, status: PlanStatus.DRAFT }
-  ];
+  // 3. Create Availability for current month
+  console.log('Creating availability for this month...');
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = now.getMonth() + 1; // 1-12
+  const daysInMonth = new Date(year, month, 0).getDate();
 
-  for (const planData of plansToCreate) {
-    const weekStartDate = new Date(planData.year, planData.month - 1, 1 + (planData.weekNumber - 1) * 7);
-    const weekEndDate = new Date(weekStartDate);
-    weekEndDate.setDate(weekEndDate.getDate() + 6);
-
-    const plan = await prisma.weeklyPlan.upsert({
-      where: {
-        year_month_weekNumber: {
-          year: planData.year,
-          month: planData.month,
-          weekNumber: planData.weekNumber,
-        }
-      },
-      update: {},
-      create: {
-        year: planData.year,
-        month: planData.month,
-        weekNumber: planData.weekNumber,
-        weekStartDate,
-        weekEndDate,
-        status: planData.status,
-        submittedById: admins[0].id,
-      },
-    });
-
-    // 5. Create Shifts for this plan
-    for (let i = 0; i < 20; i++) {
-      const shiftDate = new Date(weekStartDate);
-      shiftDate.setDate(shiftDate.getDate() + faker.number.int({ min: 0, max: 6 }));
-      
-      const startHour = faker.number.int({ min: 8, max: 16 });
-      const startTime = new Date(shiftDate);
-      startTime.setHours(startHour, 0, 0, 0);
-      
-      const endTime = new Date(startTime);
-      endTime.setHours(startHour + 8, 0, 0, 0); // 8 hour shift
-
-      const randomUser = faker.helpers.arrayElement(users);
-      const randomCategory = faker.helpers.arrayElement(categories);
-
-      const isPublished = planData.status === PlanStatus.PUBLISHED;
-      const actualStart = isPublished ? new Date(startTime.getTime()) : null;
-      const actualEnd = isPublished ? new Date(endTime.getTime()) : null;
-      if (isPublished) {
-        // randomly add some overtime (0 to 2 hours)
-        actualEnd!.setHours(actualEnd!.getHours() + faker.number.int({ min: 0, max: 2 }));
-      }
-
-      await prisma.shift.create({
-        data: {
-          weeklyPlanId: plan.id,
-          userId: randomUser.id,
-          categoryId: randomCategory.id,
-          date: shiftDate,
-          startTime,
-          endTime,
-          actualStartTime: actualStart,
-          actualEndTime: actualEnd,
-          actualBreakMinutes: isPublished ? 30 : null,
-          status: isPublished ? ShiftStatus.ACCEPTED : ShiftStatus.PENDING,
-        },
-      });
-    }
-  }
-
-  // 6. Notifications (just adding a few for random users)
-  for (let i = 0; i < 10; i++) {
-    const randomUser = faker.helpers.arrayElement(users);
-    await prisma.notification.create({
+  for (const user of users) {
+    const availabilityMonth = await prisma.availabilityMonth.create({
       data: {
-        userId: randomUser.id,
-        type: NotificationType.GENERAL,
-        channel: NotificationChannel.IN_APP,
-        title: faker.lorem.sentence({ min: 3, max: 6 }),
-        body: faker.lorem.paragraph(),
-        payload: { info: "mock_data" },
+        userId: user.id,
+        year,
+        month,
+        status: 'SUBMITTED',
+        cutoffAt: new Date(year, month - 1, 15),
+        submittedAt: new Date(),
       },
     });
+
+    const availabilityDays = [];
+    for (let day = 1; day <= daysInMonth; day++) {
+      const date = new Date(Date.UTC(year, month - 1, day));
+      
+      // Give them some fake preferred times (e.g. 09:00 to 17:00)
+      let preferredStartTime = new Date(date);
+      preferredStartTime.setUTCHours(9, 0, 0, 0);
+      
+      let preferredEndTime = new Date(date);
+      preferredEndTime.setUTCHours(17, 0, 0, 0);
+
+      // Randomly make some days unavailable
+      const isUnavailable = Math.random() > 0.8;
+      
+      availabilityDays.push({
+        availabilityMonthId: availabilityMonth.id,
+        date,
+        status: isUnavailable ? 'UNAVAILABLE' : 'AVAILABLE',
+        preferredStartTime: isUnavailable ? null : preferredStartTime,
+        preferredEndTime: isUnavailable ? null : preferredEndTime,
+      });
+    }
+
+    // @ts-ignore (enums are mapped based on Prisma client)
+    await prisma.availabilityDay.createMany({
+      data: availabilityDays as any,
+    });
   }
+
+  // 4. Create Demand for the current week
+  console.log('Creating demand for this week...');
+  // Find Monday of the current week
+  const today = new Date();
+  const currentDay = today.getUTCDay();
+  // We need Sunday for DemandWeek as per schema: `always a Sunday`
+  const diffToSunday = currentDay; 
+  const sunday = new Date(today);
+  sunday.setUTCDate(today.getUTCDate() - diffToSunday);
+  sunday.setUTCHours(0, 0, 0, 0);
+
+  const saturday = new Date(sunday);
+  saturday.setUTCDate(sunday.getUTCDate() + 6);
+
+  const demandWeek = await prisma.demandWeek.create({
+    data: {
+      weekStartDate: sunday,
+      weekEndDate: saturday,
+      status: 'DRAFT',
+    },
+  });
+
+  const dayDemands = [];
+  for (let i = 0; i < 7; i++) {
+    const date = new Date(sunday);
+    date.setUTCDate(sunday.getUTCDate() + i);
+
+    dayDemands.push({
+      demandWeekId: demandWeek.id,
+      categoryId: serviceCategory.id,
+      date,
+      requiredCount: 2, // e.g. need 2 Service staff everyday
+    });
+
+    dayDemands.push({
+      demandWeekId: demandWeek.id,
+      categoryId: kitchenCategory.id,
+      date,
+      requiredCount: 2, // e.g. need 2 Kitchen staff everyday
+    });
+  }
+
+  await prisma.dayDemand.createMany({
+    data: dayDemands,
+  });
+
+  console.log('Seed completed successfully!');
 }
 
+// const main = async () => {
+//   console.log('Starting seed...');
+
+//   // Clean up existing data to avoid conflicts
+//   await prisma.$transaction(async (tx) => {
+//     await tx.dayDemand.deleteMany({});
+//     await tx.demandWeek.deleteMany({});
+//     await tx.availabilityDay.deleteMany({});
+//     await tx.availabilityMonth.deleteMany({});
+
+//     // Delete tables that reference Category
+//     // await tx.shiftAssignment.deleteMany({});
+//     await tx.shift.deleteMany({});
+
+//     await tx.userCategory.deleteMany({});
+
+//     // await tx.category.deleteMany({});
+    
+//     await tx.user.deleteMany({});
+//   });}
+
 main()
-  .then(async () => {
-    await prisma.$disconnect();
-  })
-  .catch(async (e) => {
+  .catch((e) => {
     console.error(e);
-    await prisma.$disconnect();
     process.exit(1);
+  })
+  .finally(async () => {
+    await prisma.$disconnect();
   });

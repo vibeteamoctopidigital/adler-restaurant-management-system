@@ -36,36 +36,38 @@ export interface ValidationError {
 export function validateEmployeeForm(data: any): ValidationError[] {
   const errors: ValidationError[] = [];
 
-  if (!data.name?.trim()) {
-    errors.push({ field: 'name', message: 'Name is required' });
-  }
-
   if (!data.email?.trim()) {
     errors.push({ field: 'email', message: 'Email is required' });
   } else if (!isValidEmail(data.email)) {
     errors.push({ field: 'email', message: 'Invalid email address' });
   }
 
-    if (!data.password?.trim()) {
-    errors.push({ field: 'password', message: 'Password is required' });
+  // password is required only on create (or if provided, it must be min 6)
+  if (data.isNew && (!data.password || data.password.length < 6)) {
+    errors.push({ field: 'password', message: 'Password must be at least 6 characters' });
+  } else if (!data.isNew && data.password && data.password.length < 6) {
+    errors.push({ field: 'password', message: 'Password must be at least 6 characters' });
   }
 
-  if (!data.department?.trim()) {
-    errors.push({ field: 'department', message: 'Department is required' });
+  if (data.workloadPercent !== undefined && data.workloadPercent < 0) {
+    errors.push({ field: 'workloadPercent', message: 'Workload percent cannot be negative' });
+  }
+  if (data.workloadPercent > 100) {
+    errors.push({ field: 'workloadPercent', message: 'Workload percent cannot exceed 100' });
+  }
+  
+  if (data.hourlyRate !== undefined && data.hourlyRate < 0) {
+    errors.push({ field: 'hourlyRate', message: 'Hourly rate cannot be negative' });
+  }
+  if (data.monthlySalary !== undefined && data.monthlySalary < 0) {
+    errors.push({ field: 'monthlySalary', message: 'Monthly salary cannot be negative' });
+  }
+  if (data.contractedHoursMonthly !== undefined && data.contractedHoursMonthly < 0) {
+    errors.push({ field: 'contractedHoursMonthly', message: 'Contracted hours cannot be negative' });
   }
 
-  if (!data.designation?.trim()) {
-    errors.push({ field: 'designation', message: 'Designation is required' });
-  }
-
-  if (data.salary < 0) {
-    errors.push({ field: 'salary', message: 'Salary cannot be negative' });
-  }
   if (data.phone && !/^\+?[0-9\s\-()]+$/.test(data.phone)) {
     errors.push({ field: 'phone', message: 'Invalid phone number' });
-  }
-  if (data.address && data.address.length < 5) {
-    errors.push({ field: 'address', message: 'Address is too short' });
   }
 
   return errors;
@@ -88,5 +90,7 @@ export const DEPARTMENTS = [
   'Delivery',
   'Reception'
 ] as const;
-export const EMPLOYMENT_TYPES = ['Full-time', 'Part time', 'Intern', 'Remote', 'Hybrid'] as const;
-export const EMPLOYEE_STATUSES = ['Active', 'Leave', 'Suspension', 'Sacked', 'Resigned', 'Retired'] as const;
+
+export const EMPLOYMENT_TYPES = ['FULL_TIME', 'PART_TIME'] as const;
+export const CONTRACT_TYPES = ['HOURLY', 'MONTHLY_SALARY', 'WORKLOAD_PERCENT'] as const;
+export const EMPLOYEE_STATUSES = ['Active', 'Inactive'] as const;

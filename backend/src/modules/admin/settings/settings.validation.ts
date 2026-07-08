@@ -20,8 +20,23 @@ export const updateSettingsSchema = z
     minBreakMinutes: z.number().int().min(0).max(480).optional(),
     sessionTimeoutMinutes: z.number().int().min(1).max(1440).optional(),
     swapExpiryHours: z.number().int().min(1).max(720).optional(),
+    defaultShiftStartTime: z
+      .string()
+      .regex(/^([01]\d|2[0-3]):[0-5]\d$/, "defaultShiftStartTime must be HH:mm")
+      .optional(),
+    defaultShiftEndTime: z
+      .string()
+      .regex(/^([01]\d|2[0-3]):[0-5]\d$/, "defaultShiftEndTime must be HH:mm")
+      .optional(),
     notificationPrefs: notificationPrefsSchema.optional(),
   })
+  .refine(
+    (d) =>
+      !d.defaultShiftStartTime ||
+      !d.defaultShiftEndTime ||
+      d.defaultShiftEndTime > d.defaultShiftStartTime,
+    { message: "defaultShiftEndTime must be after defaultShiftStartTime" }
+  )
   .refine((data) => Object.keys(data).length > 0, {
     message: "Provide at least one setting to update.",
   });

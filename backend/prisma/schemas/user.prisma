@@ -38,6 +38,8 @@ model User {
 
   notifications Notification[]
   refreshTokens UserRefreshToken[]
+  timeEntries   TimeEntry[]
+  leaveRequests LeaveRequest[]
 
   @@index([isActive])
   @@index([lastName, firstName])

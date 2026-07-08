@@ -50,7 +50,13 @@ var envSchema = z.object({
   RATE_LIMIT_MAX: z.coerce.number().int().positive().default(1e3),
   AUTH_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(20),
   // Number of reverse proxies in front of the app (for correct client IPs).
-  TRUST_PROXY_HOPS: z.coerce.number().int().min(0).default(1)
+  TRUST_PROXY_HOPS: z.coerce.number().int().min(0).default(1),
+  // SMTP (optional — when unset, outgoing email is logged instead of sent).
+  SMTP_HOST: z.string().optional(),
+  SMTP_PORT: z.coerce.number().int().positive().optional(),
+  SMTP_USER: z.string().optional(),
+  SMTP_PASS: z.string().optional(),
+  SMTP_FROM: z.string().optional()
 });
 var parsed = envSchema.safeParse(process.env);
 var envValidationError = parsed.success ? null : JSON.stringify(parsed.error.flatten().fieldErrors);
@@ -88,7 +94,7 @@ import helmet from "helmet";
 import hpp from "hpp";
 
 // src/config/cors.ts
-var allowedOrigins = [...new Set([envConfig.CLIENT_URL, "http://localhost:5173"].filter(Boolean))];
+var allowedOrigins = [...new Set([envConfig.CLIENT_URL, "http://localhost:5173", "http://localhost:8081"].filter(Boolean))];
 var corsConfig = {
   origin: allowedOrigins,
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
@@ -196,7 +202,7 @@ var config = {
       "value": "prisma-client"
     },
     "output": {
-      "value": "D:\\ODL Projects\\adler-restaurant-management-system\\backend\\src\\generated\\prisma",
+      "value": "C:\\Users\\ODL\\Downloads\\semi-finnal-code-main\\semi-finnal-code-main\\backend\\src\\generated\\prisma",
       "fromEnvVar": null
     },
     "config": {
@@ -214,7 +220,7 @@ var config = {
       }
     ],
     "previewFeatures": [],
-    "sourceFilePath": "D:\\ODL Projects\\adler-restaurant-management-system\\backend\\prisma\\schemas\\base.prisma",
+    "sourceFilePath": "C:\\Users\\ODL\\Downloads\\semi-finnal-code-main\\semi-finnal-code-main\\backend\\prisma\\schemas\\base.prisma",
     "isCustomOutput": true
   },
   "relativePath": "../../../prisma/schemas",
@@ -254,6 +260,7 @@ var config = {
   createdShiftOffers   ShiftOffer[]         @relation("ShiftOfferCreatedBy")
   approvedResponses    ShiftOfferResponse[] @relation("ResponseApprovedBy")
   reviewedShiftSwaps   ShiftSwapRequest[]   @relation("ShiftSwapReviewedBy")
+  reviewedLeaves       LeaveRequest[]       @relation("LeaveReviewedBy")
 
   @@index([isActive])
   @@index([lastName, firstName])
@@ -273,6 +280,52 @@ model AdminRefreshToken {
   @@index([adminId])
   @@index([expiresAt])
   @@map("admin_refresh_tokens")
+}
+
+enum TimeEntryStatus {
+  ACTIVE
+  ON_BREAK
+  COMPLETED
+}
+
+model TimeEntry {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Optional link to the roster shift this entry fulfils.
+  shiftId String?
+  shift   Shift?  @relation(fields: [shiftId], references: [id], onDelete: SetNull)
+
+  clockInAt  DateTime
+  clockOutAt DateTime?
+
+  // Break tracking: while on break, breakStartedAt is set; accumulated
+  // completed break time lands in breakMinutes.
+  breakStartedAt DateTime?
+  breakMinutes   Int       @default(0)
+
+  // Optional geo/context captured at clock-in.
+  latitude  Decimal? @db.Decimal(9, 6)
+  longitude Decimal? @db.Decimal(9, 6)
+  location  String?
+
+  status TimeEntryStatus @default(ACTIVE)
+
+  // Derived on clock-out (kept for cheap reporting).
+  workedMinutes   Int?
+  lateMinutes     Int?
+  overtimeMinutes Int?
+
+  note String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, clockInAt])
+  @@index([userId, status])
+  @@index([shiftId])
+  @@map("time_entries")
 }
 
 model AuditLog {
@@ -443,8 +496,10 @@ enum NotificationType {
   AVAILABILITY_REMINDER
   SWAP_REQUEST_RECEIVED
   SWAP_REQUEST_RESULT
+  SWAP_PENDING_ADMIN_APPROVAL
   SHIFT_CHANGED
   RULE_VIOLATION
+  LEAVE_REQUEST_RESULT
   GENERAL
 }
 
@@ -524,6 +579,49 @@ enum ShiftSwapStatus {
   CANCELLED
 }
 
+enum LeaveType {
+  VACATION
+  SICK
+  PERSONAL
+  OTHER
+}
+
+enum LeaveStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+model LeaveRequest {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  leaveType LeaveType
+  startDate DateTime  @db.Date
+  endDate   DateTime  @db.Date
+  reason    String
+
+  status    LeaveStatus @default(PENDING)
+  adminNote String?
+
+  reviewedById String?
+  reviewedBy   Admin?    @relation("LeaveReviewedBy", fields: [reviewedById], references: [id])
+  reviewedAt   DateTime?
+
+  // Roster shifts auto-cancelled when this leave was approved.
+  affectedShifts Shift[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, status])
+  @@index([status])
+  @@index([startDate, endDate])
+  @@map("leave_requests")
+}
+
 model Notification {
   id     String @id @default(cuid())
   userId String
@@ -564,6 +662,14 @@ model OrgSettings {
   notificationPrefs     Json?
 
   swapExpiryHours Int @default(72)
+
+  // How many minutes before a shift's start an employee may clock in.
+  earlyClockInWindowMinutes Int @default(15)
+
+  // Default shift window ("HH:mm", UTC) applied when generating shifts from
+  // the day-level demand grid, which stores headcount but no times.
+  defaultShiftStartTime String @default("09:00")
+  defaultShiftEndTime   String @default("17:00")
 
   updatedAt   DateTime @updatedAt
   updatedById String?
@@ -641,11 +747,16 @@ model Shift {
 
   notifiedAt DateTime?
 
+  // Set when an approved leave request auto-cancelled this shift.
+  leaveRequestId String?
+  leaveRequest   LeaveRequest? @relation(fields: [leaveRequestId], references: [id], onDelete: SetNull)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   swapsAsInitiatorShift SwapRequest[] @relation("InitiatorShift")
   swapsAsRecipientShift SwapRequest[] @relation("RecipientShift")
+  timeEntries           TimeEntry[]
 
   @@index([userId, date])
   @@index([weeklyPlanId])
@@ -850,6 +961,8 @@ model User {
 
   notifications Notification[]
   refreshTokens UserRefreshToken[]
+  timeEntries   TimeEntry[]
+  leaveRequests LeaveRequest[]
 
   @@index([isActive])
   @@index([lastName, firstName])
@@ -886,7 +999,7 @@ model CredentialDelivery {
   @@map("credential_deliveries")
 }
 `,
-  "inlineSchemaHash": "486001a20044c779311014fbc655ded0456a9bbaa556a45a700d92a9245ebd8e",
+  "inlineSchemaHash": "f23fda30f1f2886696fd002296a13ad6d25e2905ee137f6f5340061a9b9db4a3",
   "copyEngine": true,
   "runtimeDataModel": {
     "models": {},
@@ -895,7 +1008,7 @@ model CredentialDelivery {
   },
   "dirname": ""
 };
-config.runtimeDataModel = JSON.parse('{"models":{"Admin":{"dbName":"admins","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"email","kind":"scalar","isList":false,"isRequired":true,"isUnique":true,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"passwordHash","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"isActive","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"Boolean","nativeType":null,"default":true,"isGenerated":false,"isUpdatedAt":false},{"name":"lastLoginAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"name","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"firstName","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"lastName","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false},{"name":"updatedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":true},{"name":"refreshTokens","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"AdminRefreshToken","nativeType":null,"relationName":"AdminToAdminRefreshToken","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"submittedPlans","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"WeeklyPlan","nativeType":null,"relationName":"PlanSubmittedBy","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"approvedSwaps","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"SwapRequest","nativeType":null,"relationName":"SwapAdmin","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"auditLogs","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"AuditLog","nativeType":null,"relationName":"AuditActor","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"deliveredCredentials","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"CredentialDelivery","nativeType":null,"relationName":"DeliveredBy","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"ruleCheckLogs","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"RuleCheckLog","nativeType":null,"relationName":"RuleCheckActor","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"createdShiftOffers","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"ShiftOffer","nativeType":null,"relationName":"ShiftOfferCreatedBy","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"approvedResponses","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"ShiftOfferResponse","nativeType":null,"relationName":"ResponseApprovedBy","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"reviewedShiftSwaps","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"ShiftSwapRequest","nativeType":null,"relationName":"ShiftSwapReviewedBy","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[],"uniqueIndexes":[],"isGenerated":false},"AdminRefreshToken":{"dbName":"admin_refresh_tokens","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"adminId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"admin","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Admin","nativeType":null,"relationName":"AdminToAdminRefreshToken","relationFromFields":["adminId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"tokenHash","kind":"scalar","isList":false,"isRequired":true,"isUnique":true,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"deviceInfo","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"expiresAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"revokedAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[],"uniqueIndexes":[],"isGenerated":false},"AuditLog":{"dbName":"audit_logs","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"actorId","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"actor","kind":"object","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Admin","nativeType":null,"relationName":"AuditActor","relationFromFields":["actorId"],"relationToFields":["id"],"isGenerated":false,"isUpdatedAt":false},{"name":"action","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"entityType","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"entityId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"metadata","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Json","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[],"uniqueIndexes":[],"isGenerated":false},"AvailabilityMonth":{"dbName":"availability_months","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"userId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"user","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"User","nativeType":null,"relationName":"AvailabilityMonthToUser","relationFromFields":["userId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"year","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Int","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"month","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Int","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"status","kind":"enum","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"AvailabilityMonthStatus","nativeType":null,"default":"DRAFT","isGenerated":false,"isUpdatedAt":false},{"name":"cutoffAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"submittedAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false},{"name":"updatedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":true},{"name":"days","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"AvailabilityDay","nativeType":null,"relationName":"AvailabilityDayToAvailabilityMonth","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[["userId","year","month"]],"uniqueIndexes":[{"name":null,"fields":["userId","year","month"]}],"isGenerated":false},"AvailabilityDay":{"dbName":"availability_days","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"availabilityMonthId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"availabilityMonth","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"AvailabilityMonth","nativeType":null,"relationName":"AvailabilityDayToAvailabilityMonth","relationFromFields":["availabilityMonthId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"date","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":["Date",[]],"isGenerated":false,"isUpdatedAt":false},{"name":"status","kind":"enum","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DayAvailabilityStatus","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"note","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"preferredStartTime","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"preferredEndTime","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[["availabilityMonthId","date"]],"uniqueIndexes":[{"name":null,"fields":["availabilityMonthId","date"]}],"isGenerated":false},"Category":{"dbName":"categories","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"name","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"parentId","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"parent","kind":"object","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Category","nativeType":null,"relationName":"CategoryHierarchy","relationFromFields":["parentId"],"relationToFields":["id"],"relationOnDelete":"Restrict","isGenerated":false,"isUpdatedAt":false},{"name":"children","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Category","nativeType":null,"relationName":"CategoryHierarchy","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"isActive","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"Boolean","nativeType":null,"default":true,"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false},{"name":"updatedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":true},{"name":"users","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"UserCategory","nativeType":null,"relationName":"CategoryToUserCategory","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"shifts","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Shift","nativeType":null,"relationName":"CategoryToShift","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"staffingNeeds","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"StaffingDemand","nativeType":null,"relationName":"CategoryToStaffingDemand","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"shiftOffers","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"ShiftOffer","nativeType":null,"relationName":"CategoryToShiftOffer","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"dayDemands","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DayDemand","nativeType":null,"relationName":"CategoryToDayDemand","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[["parentId","name"]],"uniqueIndexes":[{"name":null,"fields":["parentId","name"]}],"isGenerated":false},"UserCategory":{"dbName":"user_categories","schema":null,"fields":[{"name":"userId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"user","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"User","nativeType":null,"relationName":"UserToUserCategory","relationFromFields":["userId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"categoryId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"category","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Category","nativeType":null,"relationName":"CategoryToUserCategory","relationFromFields":["categoryId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"assignedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false}],"primaryKey":{"name":null,"fields":["userId","categoryId"]},"uniqueFields":[],"uniqueIndexes":[],"isGenerated":false},"DemandWeek":{"dbName":"demand_weeks","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"weekStartDate","kind":"scalar","isList":false,"isRequired":true,"isUnique":true,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":["Date",[]],"isGenerated":false,"isUpdatedAt":false},{"name":"weekEndDate","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":["Date",[]],"isGenerated":false,"isUpdatedAt":false},{"name":"status","kind":"enum","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DemandWeekStatus","nativeType":null,"default":"DRAFT","isGenerated":false,"isUpdatedAt":false},{"name":"publishedAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false},{"name":"updatedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":true},{"name":"demands","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DayDemand","nativeType":null,"relationName":"DayDemandToDemandWeek","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[["weekStartDate"]],"uniqueIndexes":[{"name":null,"fields":["weekStartDate"]}],"isGenerated":false},"DayDemand":{"dbName":"day_demands","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"demandWeekId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"demandWeek","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DemandWeek","nativeType":null,"relationName":"DayDemandToDemandWeek","relationFromFields":["demandWeekId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"categoryId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"category","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Category","nativeType":null,"relationName":"CategoryToDayDemand","relationFromFields":["categoryId"],"relationToFields":["id"],"relationOnDelete":"Restrict","isGenerated":false,"isUpdatedAt":false},{"name":"date","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":["Date",[]],"isGenerated":false,"isUpdatedAt":false},{"name":"requiredCount","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"Int","nativeType":null,"default":0,"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false},{"name":"updatedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":true}],"primaryKey":null,"uniqueFields":[["demandWeekId","categoryId","date"]],"uniqueIndexes":[{"name":null,"fields":["demandWeekId","categoryId","date"]}],"isGenerated":false},"Notification":{"dbName":"notifications","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"userId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"user","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"User","nativeType":null,"relationName":"NotificationToUser","relationFromFields":["userId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"type","kind":"enum","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"NotificationType","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"channel","kind":"enum","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"NotificationChannel","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"status","kind":"enum","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"NotificationStatus","nativeType":null,"default":"PENDING","isGenerated":false,"isUpdatedAt":false},{"name":"title","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"body","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"payload","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Json","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"sentAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"readAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"failReason","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[],"uniqueIndexes":[],"isGenerated":false},"OrgSettings":{"dbName":"org_settings","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"Int","nativeType":null,"default":1,"isGenerated":false,"isUpdatedAt":false},{"name":"maxDailyHours","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Decimal","nativeType":["Decimal",["4","2"]],"isGenerated":false,"isUpdatedAt":false},{"name":"maxWeeklyHours","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Decimal","nativeType":["Decimal",["4","2"]],"isGenerated":false,"isUpdatedAt":false},{"name":"minRestHoursBetweenShifts","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Decimal","nativeType":["Decimal",["4","2"]],"isGenerated":false,"isUpdatedAt":false},{"name":"minBreakMinutes","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Int","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"breakRequiredAfterHours","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"Decimal","nativeType":["Decimal",["4","2"]],"default":5.5,"isGenerated":false,"isUpdatedAt":false},{"name":"breakRules","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Json","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"sessionTimeoutMinutes","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"Int","nativeType":null,"default":30,"isGenerated":false,"isUpdatedAt":false},{"name":"notificationPrefs","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Json","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"swapExpiryHours","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"Int","nativeType":null,"default":72,"isGenerated":false,"isUpdatedAt":false},{"name":"updatedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":true},{"name":"updatedById","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[],"uniqueIndexes":[],"isGenerated":false},"RuleCheckLog":{"dbName":"rule_check_logs","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"context","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"entityId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"passed","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Boolean","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"details","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Json","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"checkedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false},{"name":"checkedById","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"checkedBy","kind":"object","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Admin","nativeType":null,"relationName":"RuleCheckActor","relationFromFields":["checkedById"],"relationToFields":["id"],"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[],"uniqueIndexes":[],"isGenerated":false},"WeeklyPlan":{"dbName":"weekly_plans","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"year","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Int","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"month","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Int","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"weekNumber","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Int","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"weekStartDate","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":["Date",[]],"isGenerated":false,"isUpdatedAt":false},{"name":"weekEndDate","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":["Date",[]],"isGenerated":false,"isUpdatedAt":false},{"name":"status","kind":"enum","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"PlanStatus","nativeType":null,"default":"DRAFT","isGenerated":false,"isUpdatedAt":false},{"name":"submittedAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"submittedById","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"submittedBy","kind":"object","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Admin","nativeType":null,"relationName":"PlanSubmittedBy","relationFromFields":["submittedById"],"relationToFields":["id"],"isGenerated":false,"isUpdatedAt":false},{"name":"needsRenotify","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"Boolean","nativeType":null,"default":false,"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false},{"name":"updatedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":true},{"name":"shifts","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Shift","nativeType":null,"relationName":"ShiftToWeeklyPlan","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"demands","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"StaffingDemand","nativeType":null,"relationName":"StaffingDemandToWeeklyPlan","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[["year","month","weekNumber"]],"uniqueIndexes":[{"name":null,"fields":["year","month","weekNumber"]}],"isGenerated":false},"Shift":{"dbName":"shifts","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"weeklyPlanId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"weeklyPlan","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"WeeklyPlan","nativeType":null,"relationName":"ShiftToWeeklyPlan","relationFromFields":["weeklyPlanId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"userId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"user","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"User","nativeType":null,"relationName":"ShiftToUser","relationFromFields":["userId"],"relationToFields":["id"],"relationOnDelete":"Restrict","isGenerated":false,"isUpdatedAt":false},{"name":"categoryId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"category","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Category","nativeType":null,"relationName":"CategoryToShift","relationFromFields":["categoryId"],"relationToFields":["id"],"relationOnDelete":"Restrict","isGenerated":false,"isUpdatedAt":false},{"name":"date","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":["Date",[]],"isGenerated":false,"isUpdatedAt":false},{"name":"startTime","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"endTime","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"actualStartTime","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"actualEndTime","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"actualBreakMinutes","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Int","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"status","kind":"enum","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"ShiftStatus","nativeType":null,"default":"PENDING","isGenerated":false,"isUpdatedAt":false},{"name":"rejectionReason","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"ruleViolations","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Json","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"rulePassed","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"Boolean","nativeType":null,"default":true,"isGenerated":false,"isUpdatedAt":false},{"name":"notifiedAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false},{"name":"updatedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":true},{"name":"swapsAsInitiatorShift","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"SwapRequest","nativeType":null,"relationName":"InitiatorShift","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"swapsAsRecipientShift","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"SwapRequest","nativeType":null,"relationName":"RecipientShift","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[],"uniqueIndexes":[],"isGenerated":false},"ShiftOffer":{"dbName":"shift_offers","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"jobTitle","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"categoryId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"category","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Category","nativeType":null,"relationName":"CategoryToShiftOffer","relationFromFields":["categoryId"],"relationToFields":["id"],"relationOnDelete":"Restrict","isGenerated":false,"isUpdatedAt":false},{"name":"startTime","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"endTime","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"hourlyPrice","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Decimal","nativeType":["Decimal",["10","2"]],"isGenerated":false,"isUpdatedAt":false},{"name":"description","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"createdById","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"createdBy","kind":"object","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Admin","nativeType":null,"relationName":"ShiftOfferCreatedBy","relationFromFields":["createdById"],"relationToFields":["id"],"isGenerated":false,"isUpdatedAt":false},{"name":"notifiedAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false},{"name":"updatedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":true},{"name":"responses","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"ShiftOfferResponse","nativeType":null,"relationName":"ShiftOfferToShiftOfferResponse","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"swapsAsInitiatorShift","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"ShiftSwapRequest","nativeType":null,"relationName":"ShiftSwapInitiatorShift","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"swapsAsRecipientShift","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"ShiftSwapRequest","nativeType":null,"relationName":"ShiftSwapRecipientShift","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[],"uniqueIndexes":[],"isGenerated":false},"ShiftOfferResponse":{"dbName":"shift_offer_responses","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"shiftOfferId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"shiftOffer","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"ShiftOffer","nativeType":null,"relationName":"ShiftOfferToShiftOfferResponse","relationFromFields":["shiftOfferId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"userId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"user","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"User","nativeType":null,"relationName":"ShiftOfferResponseToUser","relationFromFields":["userId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"status","kind":"enum","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"ShiftResponseStatus","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"respondedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false},{"name":"approvalStatus","kind":"enum","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"ShiftApprovalStatus","nativeType":null,"default":"PENDING","isGenerated":false,"isUpdatedAt":false},{"name":"approvedById","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"approvedBy","kind":"object","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Admin","nativeType":null,"relationName":"ResponseApprovedBy","relationFromFields":["approvedById"],"relationToFields":["id"],"isGenerated":false,"isUpdatedAt":false},{"name":"approvedAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"approvalNote","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[["shiftOfferId","userId"]],"uniqueIndexes":[{"name":null,"fields":["shiftOfferId","userId"]}],"isGenerated":false},"ShiftSwapRequest":{"dbName":"shift_swap_requests","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"initiatorUserId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"initiatorUser","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"User","nativeType":null,"relationName":"ShiftSwapInitiatorUser","relationFromFields":["initiatorUserId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"initiatorShiftId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"initiatorShift","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"ShiftOffer","nativeType":null,"relationName":"ShiftSwapInitiatorShift","relationFromFields":["initiatorShiftId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"recipientUserId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"recipientUser","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"User","nativeType":null,"relationName":"ShiftSwapRecipientUser","relationFromFields":["recipientUserId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"recipientShiftId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"recipientShift","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"ShiftOffer","nativeType":null,"relationName":"ShiftSwapRecipientShift","relationFromFields":["recipientShiftId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"status","kind":"enum","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"ShiftSwapStatus","nativeType":null,"default":"PENDING","isGenerated":false,"isUpdatedAt":false},{"name":"reason","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"reviewedById","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"reviewedBy","kind":"object","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Admin","nativeType":null,"relationName":"ShiftSwapReviewedBy","relationFromFields":["reviewedById"],"relationToFields":["id"],"isGenerated":false,"isUpdatedAt":false},{"name":"reviewedAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"adminNote","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false},{"name":"updatedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":true}],"primaryKey":null,"uniqueFields":[],"uniqueIndexes":[],"isGenerated":false},"SwapRequest":{"dbName":"swap_requests","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"swapType","kind":"enum","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"SwapType","nativeType":null,"default":"TARGETED","isGenerated":false,"isUpdatedAt":false},{"name":"initiatorUserId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"initiatorUser","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"User","nativeType":null,"relationName":"SwapInitiator","relationFromFields":["initiatorUserId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"initiatorShiftId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"initiatorShift","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Shift","nativeType":null,"relationName":"InitiatorShift","relationFromFields":["initiatorShiftId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"recipientUserId","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"recipientUser","kind":"object","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"User","nativeType":null,"relationName":"SwapRecipient","relationFromFields":["recipientUserId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"recipientShiftId","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"recipientShift","kind":"object","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Shift","nativeType":null,"relationName":"RecipientShift","relationFromFields":["recipientShiftId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"status","kind":"enum","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"SwapStatus","nativeType":null,"default":"PENDING_RECIPIENT","isGenerated":false,"isUpdatedAt":false},{"name":"recipientRespondedAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"ruleCheckResult","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Json","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"ruleCheckPassed","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Boolean","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"ruleCheckedAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"approvedById","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"approvedBy","kind":"object","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Admin","nativeType":null,"relationName":"SwapAdmin","relationFromFields":["approvedById"],"relationToFields":["id"],"isGenerated":false,"isUpdatedAt":false},{"name":"adminReason","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"resolvedAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"expiresAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false},{"name":"updatedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":true}],"primaryKey":null,"uniqueFields":[],"uniqueIndexes":[],"isGenerated":false},"StaffingDemand":{"dbName":"staffing_demands","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"weeklyPlanId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"weeklyPlan","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"WeeklyPlan","nativeType":null,"relationName":"StaffingDemandToWeeklyPlan","relationFromFields":["weeklyPlanId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"date","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":["Date",[]],"isGenerated":false,"isUpdatedAt":false},{"name":"categoryId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"category","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Category","nativeType":null,"relationName":"CategoryToStaffingDemand","relationFromFields":["categoryId"],"relationToFields":["id"],"relationOnDelete":"Restrict","isGenerated":false,"isUpdatedAt":false},{"name":"requiredCount","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Int","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"startTime","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"endTime","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"note","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false},{"name":"updatedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":true}],"primaryKey":null,"uniqueFields":[["weeklyPlanId","date","categoryId","startTime"]],"uniqueIndexes":[{"name":null,"fields":["weeklyPlanId","date","categoryId","startTime"]}],"isGenerated":false},"User":{"dbName":"users","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"email","kind":"scalar","isList":false,"isRequired":true,"isUnique":true,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"passwordHash","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"mustChangePassword","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"Boolean","nativeType":null,"default":true,"isGenerated":false,"isUpdatedAt":false},{"name":"isActive","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"Boolean","nativeType":null,"default":true,"isGenerated":false,"isUpdatedAt":false},{"name":"lastLoginAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"name","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"firstName","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"lastName","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"phone","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"address","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"department","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"designation","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"employeeType","kind":"enum","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"EmployeeType","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"contractType","kind":"enum","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"ContractType","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"workloadPercent","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Decimal","nativeType":["Decimal",["5","2"]],"isGenerated":false,"isUpdatedAt":false},{"name":"hourlyRate","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Decimal","nativeType":["Decimal",["10","2"]],"isGenerated":false,"isUpdatedAt":false},{"name":"monthlySalary","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Decimal","nativeType":["Decimal",["10","2"]],"isGenerated":false,"isUpdatedAt":false},{"name":"contractedHoursMonthly","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Decimal","nativeType":["Decimal",["6","2"]],"isGenerated":false,"isUpdatedAt":false},{"name":"hireDate","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"deactivatedAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false},{"name":"updatedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":true},{"name":"categories","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"UserCategory","nativeType":null,"relationName":"UserToUserCategory","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"availabilityMonths","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"AvailabilityMonth","nativeType":null,"relationName":"AvailabilityMonthToUser","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"shifts","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Shift","nativeType":null,"relationName":"ShiftToUser","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"shiftOfferResponses","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"ShiftOfferResponse","nativeType":null,"relationName":"ShiftOfferResponseToUser","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"initiatedShiftSwaps","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"ShiftSwapRequest","nativeType":null,"relationName":"ShiftSwapInitiatorUser","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"receivedShiftSwaps","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"ShiftSwapRequest","nativeType":null,"relationName":"ShiftSwapRecipientUser","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"initiatedSwaps","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"SwapRequest","nativeType":null,"relationName":"SwapInitiator","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"receivedSwaps","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"SwapRequest","nativeType":null,"relationName":"SwapRecipient","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"receivedCredentials","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"CredentialDelivery","nativeType":null,"relationName":"CredentialRecipient","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"notifications","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Notification","nativeType":null,"relationName":"NotificationToUser","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"refreshTokens","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"UserRefreshToken","nativeType":null,"relationName":"UserToUserRefreshToken","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[],"uniqueIndexes":[],"isGenerated":false},"UserRefreshToken":{"dbName":"user_refresh_tokens","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"userId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"user","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"User","nativeType":null,"relationName":"UserToUserRefreshToken","relationFromFields":["userId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"tokenHash","kind":"scalar","isList":false,"isRequired":true,"isUnique":true,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"deviceInfo","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"expiresAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"revokedAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[],"uniqueIndexes":[],"isGenerated":false},"CredentialDelivery":{"dbName":"credential_deliveries","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"userId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"user","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"User","nativeType":null,"relationName":"CredentialRecipient","relationFromFields":["userId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"method","kind":"enum","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"CredentialDeliveryMethod","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"deliveredById","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"deliveredBy","kind":"object","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Admin","nativeType":null,"relationName":"DeliveredBy","relationFromFields":["deliveredById"],"relationToFields":["id"],"isGenerated":false,"isUpdatedAt":false},{"name":"deliveredAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false},{"name":"note","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[],"uniqueIndexes":[],"isGenerated":false}},"enums":{"DemandWeekStatus":{"values":[{"name":"DRAFT","dbName":null},{"name":"PUBLISHED","dbName":null}],"dbName":null},"AvailabilityMonthStatus":{"values":[{"name":"DRAFT","dbName":null},{"name":"SUBMITTED","dbName":null},{"name":"LOCKED","dbName":null}],"dbName":null},"DayAvailabilityStatus":{"values":[{"name":"AVAILABLE","dbName":null},{"name":"UNAVAILABLE","dbName":null},{"name":"WISH","dbName":null}],"dbName":null},"NotificationType":{"values":[{"name":"WEEKLY_SHIFTS_PUBLISHED","dbName":null},{"name":"SHIFT_OFFER_PUBLISHED","dbName":null},{"name":"AVAILABILITY_REMINDER","dbName":null},{"name":"SWAP_REQUEST_RECEIVED","dbName":null},{"name":"SWAP_REQUEST_RESULT","dbName":null},{"name":"SHIFT_CHANGED","dbName":null},{"name":"RULE_VIOLATION","dbName":null},{"name":"GENERAL","dbName":null}],"dbName":null},"NotificationChannel":{"values":[{"name":"PUSH","dbName":null},{"name":"EMAIL","dbName":null},{"name":"IN_APP","dbName":null}],"dbName":null},"NotificationStatus":{"values":[{"name":"PENDING","dbName":null},{"name":"SENT","dbName":null},{"name":"FAILED","dbName":null},{"name":"READ","dbName":null}],"dbName":null},"PlanStatus":{"values":[{"name":"DRAFT","dbName":null},{"name":"SUBMITTED","dbName":null},{"name":"PUBLISHED","dbName":null}],"dbName":null},"ShiftStatus":{"values":[{"name":"PENDING","dbName":null},{"name":"ACCEPTED","dbName":null},{"name":"REJECTED","dbName":null},{"name":"CANCELLED","dbName":null},{"name":"SWAPPED_OUT","dbName":null}],"dbName":null},"SwapType":{"values":[{"name":"TARGETED","dbName":null},{"name":"OPEN","dbName":null}],"dbName":null},"SwapStatus":{"values":[{"name":"PENDING_RECIPIENT","dbName":null},{"name":"PENDING_ADMIN_APPROVAL","dbName":null},{"name":"APPROVED","dbName":null},{"name":"REJECTED","dbName":null},{"name":"EXPIRED","dbName":null},{"name":"CANCELLED","dbName":null}],"dbName":null},"CredentialDeliveryMethod":{"values":[{"name":"EMAIL","dbName":null},{"name":"SMS","dbName":null},{"name":"IN_PERSON","dbName":null}],"dbName":null},"ContractType":{"values":[{"name":"HOURLY","dbName":null},{"name":"MONTHLY_SALARY","dbName":null},{"name":"WORKLOAD_PERCENT","dbName":null}],"dbName":null},"EmployeeType":{"values":[{"name":"FULL_TIME","dbName":null},{"name":"PART_TIME","dbName":null}],"dbName":null},"ShiftResponseStatus":{"values":[{"name":"ACCEPTED","dbName":null},{"name":"REJECTED","dbName":null}],"dbName":null},"ShiftApprovalStatus":{"values":[{"name":"PENDING","dbName":null},{"name":"APPROVED","dbName":null},{"name":"REJECTED","dbName":null}],"dbName":null},"ShiftSwapStatus":{"values":[{"name":"PENDING","dbName":null},{"name":"APPROVED","dbName":null},{"name":"REJECTED","dbName":null},{"name":"CANCELLED","dbName":null}],"dbName":null}},"types":{}}');
+config.runtimeDataModel = JSON.parse('{"models":{"Admin":{"dbName":"admins","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"email","kind":"scalar","isList":false,"isRequired":true,"isUnique":true,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"passwordHash","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"isActive","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"Boolean","nativeType":null,"default":true,"isGenerated":false,"isUpdatedAt":false},{"name":"lastLoginAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"name","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"firstName","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"lastName","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false},{"name":"updatedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":true},{"name":"refreshTokens","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"AdminRefreshToken","nativeType":null,"relationName":"AdminToAdminRefreshToken","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"submittedPlans","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"WeeklyPlan","nativeType":null,"relationName":"PlanSubmittedBy","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"approvedSwaps","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"SwapRequest","nativeType":null,"relationName":"SwapAdmin","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"auditLogs","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"AuditLog","nativeType":null,"relationName":"AuditActor","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"deliveredCredentials","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"CredentialDelivery","nativeType":null,"relationName":"DeliveredBy","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"ruleCheckLogs","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"RuleCheckLog","nativeType":null,"relationName":"RuleCheckActor","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"createdShiftOffers","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"ShiftOffer","nativeType":null,"relationName":"ShiftOfferCreatedBy","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"approvedResponses","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"ShiftOfferResponse","nativeType":null,"relationName":"ResponseApprovedBy","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"reviewedShiftSwaps","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"ShiftSwapRequest","nativeType":null,"relationName":"ShiftSwapReviewedBy","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"reviewedLeaves","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"LeaveRequest","nativeType":null,"relationName":"LeaveReviewedBy","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[],"uniqueIndexes":[],"isGenerated":false},"AdminRefreshToken":{"dbName":"admin_refresh_tokens","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"adminId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"admin","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Admin","nativeType":null,"relationName":"AdminToAdminRefreshToken","relationFromFields":["adminId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"tokenHash","kind":"scalar","isList":false,"isRequired":true,"isUnique":true,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"deviceInfo","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"expiresAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"revokedAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[],"uniqueIndexes":[],"isGenerated":false},"TimeEntry":{"dbName":"time_entries","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"userId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"user","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"User","nativeType":null,"relationName":"TimeEntryToUser","relationFromFields":["userId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"shiftId","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"shift","kind":"object","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Shift","nativeType":null,"relationName":"ShiftToTimeEntry","relationFromFields":["shiftId"],"relationToFields":["id"],"relationOnDelete":"SetNull","isGenerated":false,"isUpdatedAt":false},{"name":"clockInAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"clockOutAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"breakStartedAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"breakMinutes","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"Int","nativeType":null,"default":0,"isGenerated":false,"isUpdatedAt":false},{"name":"latitude","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Decimal","nativeType":["Decimal",["9","6"]],"isGenerated":false,"isUpdatedAt":false},{"name":"longitude","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Decimal","nativeType":["Decimal",["9","6"]],"isGenerated":false,"isUpdatedAt":false},{"name":"location","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"status","kind":"enum","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"TimeEntryStatus","nativeType":null,"default":"ACTIVE","isGenerated":false,"isUpdatedAt":false},{"name":"workedMinutes","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Int","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"lateMinutes","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Int","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"overtimeMinutes","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Int","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"note","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false},{"name":"updatedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":true}],"primaryKey":null,"uniqueFields":[],"uniqueIndexes":[],"isGenerated":false},"AuditLog":{"dbName":"audit_logs","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"actorId","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"actor","kind":"object","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Admin","nativeType":null,"relationName":"AuditActor","relationFromFields":["actorId"],"relationToFields":["id"],"isGenerated":false,"isUpdatedAt":false},{"name":"action","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"entityType","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"entityId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"metadata","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Json","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[],"uniqueIndexes":[],"isGenerated":false},"AvailabilityMonth":{"dbName":"availability_months","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"userId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"user","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"User","nativeType":null,"relationName":"AvailabilityMonthToUser","relationFromFields":["userId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"year","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Int","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"month","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Int","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"status","kind":"enum","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"AvailabilityMonthStatus","nativeType":null,"default":"DRAFT","isGenerated":false,"isUpdatedAt":false},{"name":"cutoffAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"submittedAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false},{"name":"updatedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":true},{"name":"days","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"AvailabilityDay","nativeType":null,"relationName":"AvailabilityDayToAvailabilityMonth","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[["userId","year","month"]],"uniqueIndexes":[{"name":null,"fields":["userId","year","month"]}],"isGenerated":false},"AvailabilityDay":{"dbName":"availability_days","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"availabilityMonthId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"availabilityMonth","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"AvailabilityMonth","nativeType":null,"relationName":"AvailabilityDayToAvailabilityMonth","relationFromFields":["availabilityMonthId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"date","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":["Date",[]],"isGenerated":false,"isUpdatedAt":false},{"name":"status","kind":"enum","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DayAvailabilityStatus","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"note","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"preferredStartTime","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"preferredEndTime","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[["availabilityMonthId","date"]],"uniqueIndexes":[{"name":null,"fields":["availabilityMonthId","date"]}],"isGenerated":false},"Category":{"dbName":"categories","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"name","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"parentId","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"parent","kind":"object","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Category","nativeType":null,"relationName":"CategoryHierarchy","relationFromFields":["parentId"],"relationToFields":["id"],"relationOnDelete":"Restrict","isGenerated":false,"isUpdatedAt":false},{"name":"children","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Category","nativeType":null,"relationName":"CategoryHierarchy","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"isActive","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"Boolean","nativeType":null,"default":true,"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false},{"name":"updatedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":true},{"name":"users","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"UserCategory","nativeType":null,"relationName":"CategoryToUserCategory","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"shifts","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Shift","nativeType":null,"relationName":"CategoryToShift","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"staffingNeeds","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"StaffingDemand","nativeType":null,"relationName":"CategoryToStaffingDemand","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"shiftOffers","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"ShiftOffer","nativeType":null,"relationName":"CategoryToShiftOffer","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"dayDemands","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DayDemand","nativeType":null,"relationName":"CategoryToDayDemand","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[["parentId","name"]],"uniqueIndexes":[{"name":null,"fields":["parentId","name"]}],"isGenerated":false},"UserCategory":{"dbName":"user_categories","schema":null,"fields":[{"name":"userId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"user","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"User","nativeType":null,"relationName":"UserToUserCategory","relationFromFields":["userId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"categoryId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"category","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Category","nativeType":null,"relationName":"CategoryToUserCategory","relationFromFields":["categoryId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"assignedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false}],"primaryKey":{"name":null,"fields":["userId","categoryId"]},"uniqueFields":[],"uniqueIndexes":[],"isGenerated":false},"DemandWeek":{"dbName":"demand_weeks","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"weekStartDate","kind":"scalar","isList":false,"isRequired":true,"isUnique":true,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":["Date",[]],"isGenerated":false,"isUpdatedAt":false},{"name":"weekEndDate","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":["Date",[]],"isGenerated":false,"isUpdatedAt":false},{"name":"status","kind":"enum","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DemandWeekStatus","nativeType":null,"default":"DRAFT","isGenerated":false,"isUpdatedAt":false},{"name":"publishedAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false},{"name":"updatedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":true},{"name":"demands","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DayDemand","nativeType":null,"relationName":"DayDemandToDemandWeek","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[["weekStartDate"]],"uniqueIndexes":[{"name":null,"fields":["weekStartDate"]}],"isGenerated":false},"DayDemand":{"dbName":"day_demands","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"demandWeekId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"demandWeek","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DemandWeek","nativeType":null,"relationName":"DayDemandToDemandWeek","relationFromFields":["demandWeekId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"categoryId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"category","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Category","nativeType":null,"relationName":"CategoryToDayDemand","relationFromFields":["categoryId"],"relationToFields":["id"],"relationOnDelete":"Restrict","isGenerated":false,"isUpdatedAt":false},{"name":"date","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":["Date",[]],"isGenerated":false,"isUpdatedAt":false},{"name":"requiredCount","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"Int","nativeType":null,"default":0,"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false},{"name":"updatedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":true}],"primaryKey":null,"uniqueFields":[["demandWeekId","categoryId","date"]],"uniqueIndexes":[{"name":null,"fields":["demandWeekId","categoryId","date"]}],"isGenerated":false},"LeaveRequest":{"dbName":"leave_requests","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"userId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"user","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"User","nativeType":null,"relationName":"LeaveRequestToUser","relationFromFields":["userId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"leaveType","kind":"enum","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"LeaveType","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"startDate","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":["Date",[]],"isGenerated":false,"isUpdatedAt":false},{"name":"endDate","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":["Date",[]],"isGenerated":false,"isUpdatedAt":false},{"name":"reason","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"status","kind":"enum","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"LeaveStatus","nativeType":null,"default":"PENDING","isGenerated":false,"isUpdatedAt":false},{"name":"adminNote","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"reviewedById","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"reviewedBy","kind":"object","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Admin","nativeType":null,"relationName":"LeaveReviewedBy","relationFromFields":["reviewedById"],"relationToFields":["id"],"isGenerated":false,"isUpdatedAt":false},{"name":"reviewedAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"affectedShifts","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Shift","nativeType":null,"relationName":"LeaveRequestToShift","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false},{"name":"updatedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":true}],"primaryKey":null,"uniqueFields":[],"uniqueIndexes":[],"isGenerated":false},"Notification":{"dbName":"notifications","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"userId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"user","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"User","nativeType":null,"relationName":"NotificationToUser","relationFromFields":["userId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"type","kind":"enum","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"NotificationType","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"channel","kind":"enum","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"NotificationChannel","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"status","kind":"enum","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"NotificationStatus","nativeType":null,"default":"PENDING","isGenerated":false,"isUpdatedAt":false},{"name":"title","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"body","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"payload","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Json","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"sentAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"readAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"failReason","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[],"uniqueIndexes":[],"isGenerated":false},"OrgSettings":{"dbName":"org_settings","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"Int","nativeType":null,"default":1,"isGenerated":false,"isUpdatedAt":false},{"name":"maxDailyHours","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Decimal","nativeType":["Decimal",["4","2"]],"isGenerated":false,"isUpdatedAt":false},{"name":"maxWeeklyHours","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Decimal","nativeType":["Decimal",["4","2"]],"isGenerated":false,"isUpdatedAt":false},{"name":"minRestHoursBetweenShifts","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Decimal","nativeType":["Decimal",["4","2"]],"isGenerated":false,"isUpdatedAt":false},{"name":"minBreakMinutes","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Int","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"breakRequiredAfterHours","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"Decimal","nativeType":["Decimal",["4","2"]],"default":5.5,"isGenerated":false,"isUpdatedAt":false},{"name":"breakRules","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Json","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"sessionTimeoutMinutes","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"Int","nativeType":null,"default":30,"isGenerated":false,"isUpdatedAt":false},{"name":"notificationPrefs","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Json","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"swapExpiryHours","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"Int","nativeType":null,"default":72,"isGenerated":false,"isUpdatedAt":false},{"name":"earlyClockInWindowMinutes","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"Int","nativeType":null,"default":15,"isGenerated":false,"isUpdatedAt":false},{"name":"defaultShiftStartTime","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":"09:00","isGenerated":false,"isUpdatedAt":false},{"name":"defaultShiftEndTime","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":"17:00","isGenerated":false,"isUpdatedAt":false},{"name":"updatedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":true},{"name":"updatedById","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[],"uniqueIndexes":[],"isGenerated":false},"RuleCheckLog":{"dbName":"rule_check_logs","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"context","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"entityId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"passed","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Boolean","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"details","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Json","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"checkedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false},{"name":"checkedById","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"checkedBy","kind":"object","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Admin","nativeType":null,"relationName":"RuleCheckActor","relationFromFields":["checkedById"],"relationToFields":["id"],"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[],"uniqueIndexes":[],"isGenerated":false},"WeeklyPlan":{"dbName":"weekly_plans","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"year","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Int","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"month","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Int","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"weekNumber","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Int","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"weekStartDate","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":["Date",[]],"isGenerated":false,"isUpdatedAt":false},{"name":"weekEndDate","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":["Date",[]],"isGenerated":false,"isUpdatedAt":false},{"name":"status","kind":"enum","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"PlanStatus","nativeType":null,"default":"DRAFT","isGenerated":false,"isUpdatedAt":false},{"name":"submittedAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"submittedById","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"submittedBy","kind":"object","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Admin","nativeType":null,"relationName":"PlanSubmittedBy","relationFromFields":["submittedById"],"relationToFields":["id"],"isGenerated":false,"isUpdatedAt":false},{"name":"needsRenotify","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"Boolean","nativeType":null,"default":false,"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false},{"name":"updatedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":true},{"name":"shifts","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Shift","nativeType":null,"relationName":"ShiftToWeeklyPlan","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"demands","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"StaffingDemand","nativeType":null,"relationName":"StaffingDemandToWeeklyPlan","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[["year","month","weekNumber"]],"uniqueIndexes":[{"name":null,"fields":["year","month","weekNumber"]}],"isGenerated":false},"Shift":{"dbName":"shifts","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"weeklyPlanId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"weeklyPlan","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"WeeklyPlan","nativeType":null,"relationName":"ShiftToWeeklyPlan","relationFromFields":["weeklyPlanId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"userId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"user","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"User","nativeType":null,"relationName":"ShiftToUser","relationFromFields":["userId"],"relationToFields":["id"],"relationOnDelete":"Restrict","isGenerated":false,"isUpdatedAt":false},{"name":"categoryId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"category","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Category","nativeType":null,"relationName":"CategoryToShift","relationFromFields":["categoryId"],"relationToFields":["id"],"relationOnDelete":"Restrict","isGenerated":false,"isUpdatedAt":false},{"name":"date","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":["Date",[]],"isGenerated":false,"isUpdatedAt":false},{"name":"startTime","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"endTime","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"actualStartTime","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"actualEndTime","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"actualBreakMinutes","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Int","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"status","kind":"enum","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"ShiftStatus","nativeType":null,"default":"PENDING","isGenerated":false,"isUpdatedAt":false},{"name":"rejectionReason","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"ruleViolations","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Json","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"rulePassed","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"Boolean","nativeType":null,"default":true,"isGenerated":false,"isUpdatedAt":false},{"name":"notifiedAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"leaveRequestId","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"leaveRequest","kind":"object","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"LeaveRequest","nativeType":null,"relationName":"LeaveRequestToShift","relationFromFields":["leaveRequestId"],"relationToFields":["id"],"relationOnDelete":"SetNull","isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false},{"name":"updatedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":true},{"name":"swapsAsInitiatorShift","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"SwapRequest","nativeType":null,"relationName":"InitiatorShift","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"swapsAsRecipientShift","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"SwapRequest","nativeType":null,"relationName":"RecipientShift","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"timeEntries","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"TimeEntry","nativeType":null,"relationName":"ShiftToTimeEntry","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[],"uniqueIndexes":[],"isGenerated":false},"ShiftOffer":{"dbName":"shift_offers","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"jobTitle","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"categoryId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"category","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Category","nativeType":null,"relationName":"CategoryToShiftOffer","relationFromFields":["categoryId"],"relationToFields":["id"],"relationOnDelete":"Restrict","isGenerated":false,"isUpdatedAt":false},{"name":"startTime","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"endTime","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"hourlyPrice","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Decimal","nativeType":["Decimal",["10","2"]],"isGenerated":false,"isUpdatedAt":false},{"name":"description","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"createdById","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"createdBy","kind":"object","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Admin","nativeType":null,"relationName":"ShiftOfferCreatedBy","relationFromFields":["createdById"],"relationToFields":["id"],"isGenerated":false,"isUpdatedAt":false},{"name":"notifiedAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false},{"name":"updatedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":true},{"name":"responses","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"ShiftOfferResponse","nativeType":null,"relationName":"ShiftOfferToShiftOfferResponse","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"swapsAsInitiatorShift","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"ShiftSwapRequest","nativeType":null,"relationName":"ShiftSwapInitiatorShift","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"swapsAsRecipientShift","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"ShiftSwapRequest","nativeType":null,"relationName":"ShiftSwapRecipientShift","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[],"uniqueIndexes":[],"isGenerated":false},"ShiftOfferResponse":{"dbName":"shift_offer_responses","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"shiftOfferId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"shiftOffer","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"ShiftOffer","nativeType":null,"relationName":"ShiftOfferToShiftOfferResponse","relationFromFields":["shiftOfferId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"userId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"user","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"User","nativeType":null,"relationName":"ShiftOfferResponseToUser","relationFromFields":["userId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"status","kind":"enum","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"ShiftResponseStatus","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"respondedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false},{"name":"approvalStatus","kind":"enum","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"ShiftApprovalStatus","nativeType":null,"default":"PENDING","isGenerated":false,"isUpdatedAt":false},{"name":"approvedById","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"approvedBy","kind":"object","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Admin","nativeType":null,"relationName":"ResponseApprovedBy","relationFromFields":["approvedById"],"relationToFields":["id"],"isGenerated":false,"isUpdatedAt":false},{"name":"approvedAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"approvalNote","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[["shiftOfferId","userId"]],"uniqueIndexes":[{"name":null,"fields":["shiftOfferId","userId"]}],"isGenerated":false},"ShiftSwapRequest":{"dbName":"shift_swap_requests","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"initiatorUserId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"initiatorUser","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"User","nativeType":null,"relationName":"ShiftSwapInitiatorUser","relationFromFields":["initiatorUserId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"initiatorShiftId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"initiatorShift","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"ShiftOffer","nativeType":null,"relationName":"ShiftSwapInitiatorShift","relationFromFields":["initiatorShiftId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"recipientUserId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"recipientUser","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"User","nativeType":null,"relationName":"ShiftSwapRecipientUser","relationFromFields":["recipientUserId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"recipientShiftId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"recipientShift","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"ShiftOffer","nativeType":null,"relationName":"ShiftSwapRecipientShift","relationFromFields":["recipientShiftId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"status","kind":"enum","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"ShiftSwapStatus","nativeType":null,"default":"PENDING","isGenerated":false,"isUpdatedAt":false},{"name":"reason","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"reviewedById","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"reviewedBy","kind":"object","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Admin","nativeType":null,"relationName":"ShiftSwapReviewedBy","relationFromFields":["reviewedById"],"relationToFields":["id"],"isGenerated":false,"isUpdatedAt":false},{"name":"reviewedAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"adminNote","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false},{"name":"updatedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":true}],"primaryKey":null,"uniqueFields":[],"uniqueIndexes":[],"isGenerated":false},"SwapRequest":{"dbName":"swap_requests","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"swapType","kind":"enum","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"SwapType","nativeType":null,"default":"TARGETED","isGenerated":false,"isUpdatedAt":false},{"name":"initiatorUserId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"initiatorUser","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"User","nativeType":null,"relationName":"SwapInitiator","relationFromFields":["initiatorUserId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"initiatorShiftId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"initiatorShift","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Shift","nativeType":null,"relationName":"InitiatorShift","relationFromFields":["initiatorShiftId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"recipientUserId","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"recipientUser","kind":"object","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"User","nativeType":null,"relationName":"SwapRecipient","relationFromFields":["recipientUserId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"recipientShiftId","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"recipientShift","kind":"object","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Shift","nativeType":null,"relationName":"RecipientShift","relationFromFields":["recipientShiftId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"status","kind":"enum","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"SwapStatus","nativeType":null,"default":"PENDING_RECIPIENT","isGenerated":false,"isUpdatedAt":false},{"name":"recipientRespondedAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"ruleCheckResult","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Json","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"ruleCheckPassed","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Boolean","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"ruleCheckedAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"approvedById","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"approvedBy","kind":"object","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Admin","nativeType":null,"relationName":"SwapAdmin","relationFromFields":["approvedById"],"relationToFields":["id"],"isGenerated":false,"isUpdatedAt":false},{"name":"adminReason","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"resolvedAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"expiresAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false},{"name":"updatedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":true}],"primaryKey":null,"uniqueFields":[],"uniqueIndexes":[],"isGenerated":false},"StaffingDemand":{"dbName":"staffing_demands","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"weeklyPlanId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"weeklyPlan","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"WeeklyPlan","nativeType":null,"relationName":"StaffingDemandToWeeklyPlan","relationFromFields":["weeklyPlanId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"date","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":["Date",[]],"isGenerated":false,"isUpdatedAt":false},{"name":"categoryId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"category","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Category","nativeType":null,"relationName":"CategoryToStaffingDemand","relationFromFields":["categoryId"],"relationToFields":["id"],"relationOnDelete":"Restrict","isGenerated":false,"isUpdatedAt":false},{"name":"requiredCount","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Int","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"startTime","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"endTime","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"note","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false},{"name":"updatedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":true}],"primaryKey":null,"uniqueFields":[["weeklyPlanId","date","categoryId","startTime"]],"uniqueIndexes":[{"name":null,"fields":["weeklyPlanId","date","categoryId","startTime"]}],"isGenerated":false},"User":{"dbName":"users","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"email","kind":"scalar","isList":false,"isRequired":true,"isUnique":true,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"passwordHash","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"mustChangePassword","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"Boolean","nativeType":null,"default":true,"isGenerated":false,"isUpdatedAt":false},{"name":"isActive","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"Boolean","nativeType":null,"default":true,"isGenerated":false,"isUpdatedAt":false},{"name":"lastLoginAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"name","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"firstName","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"lastName","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"phone","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"address","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"department","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"designation","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"employeeType","kind":"enum","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"EmployeeType","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"contractType","kind":"enum","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"ContractType","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"workloadPercent","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Decimal","nativeType":["Decimal",["5","2"]],"isGenerated":false,"isUpdatedAt":false},{"name":"hourlyRate","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Decimal","nativeType":["Decimal",["10","2"]],"isGenerated":false,"isUpdatedAt":false},{"name":"monthlySalary","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Decimal","nativeType":["Decimal",["10","2"]],"isGenerated":false,"isUpdatedAt":false},{"name":"contractedHoursMonthly","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Decimal","nativeType":["Decimal",["6","2"]],"isGenerated":false,"isUpdatedAt":false},{"name":"hireDate","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"deactivatedAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false},{"name":"updatedAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":true},{"name":"categories","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"UserCategory","nativeType":null,"relationName":"UserToUserCategory","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"availabilityMonths","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"AvailabilityMonth","nativeType":null,"relationName":"AvailabilityMonthToUser","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"shifts","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Shift","nativeType":null,"relationName":"ShiftToUser","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"shiftOfferResponses","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"ShiftOfferResponse","nativeType":null,"relationName":"ShiftOfferResponseToUser","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"initiatedShiftSwaps","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"ShiftSwapRequest","nativeType":null,"relationName":"ShiftSwapInitiatorUser","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"receivedShiftSwaps","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"ShiftSwapRequest","nativeType":null,"relationName":"ShiftSwapRecipientUser","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"initiatedSwaps","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"SwapRequest","nativeType":null,"relationName":"SwapInitiator","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"receivedSwaps","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"SwapRequest","nativeType":null,"relationName":"SwapRecipient","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"receivedCredentials","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"CredentialDelivery","nativeType":null,"relationName":"CredentialRecipient","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"notifications","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Notification","nativeType":null,"relationName":"NotificationToUser","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"refreshTokens","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"UserRefreshToken","nativeType":null,"relationName":"UserToUserRefreshToken","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"timeEntries","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"TimeEntry","nativeType":null,"relationName":"TimeEntryToUser","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false},{"name":"leaveRequests","kind":"object","isList":true,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"LeaveRequest","nativeType":null,"relationName":"LeaveRequestToUser","relationFromFields":[],"relationToFields":[],"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[],"uniqueIndexes":[],"isGenerated":false},"UserRefreshToken":{"dbName":"user_refresh_tokens","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"userId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"user","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"User","nativeType":null,"relationName":"UserToUserRefreshToken","relationFromFields":["userId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"tokenHash","kind":"scalar","isList":false,"isRequired":true,"isUnique":true,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"deviceInfo","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"expiresAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"revokedAt","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"DateTime","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"createdAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[],"uniqueIndexes":[],"isGenerated":false},"CredentialDelivery":{"dbName":"credential_deliveries","schema":null,"fields":[{"name":"id","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":true,"isReadOnly":false,"hasDefaultValue":true,"type":"String","nativeType":null,"default":{"name":"cuid","args":[1]},"isGenerated":false,"isUpdatedAt":false},{"name":"userId","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"user","kind":"object","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"User","nativeType":null,"relationName":"CredentialRecipient","relationFromFields":["userId"],"relationToFields":["id"],"relationOnDelete":"Cascade","isGenerated":false,"isUpdatedAt":false},{"name":"method","kind":"enum","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"CredentialDeliveryMethod","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"deliveredById","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":true,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false},{"name":"deliveredBy","kind":"object","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"Admin","nativeType":null,"relationName":"DeliveredBy","relationFromFields":["deliveredById"],"relationToFields":["id"],"isGenerated":false,"isUpdatedAt":false},{"name":"deliveredAt","kind":"scalar","isList":false,"isRequired":true,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":true,"type":"DateTime","nativeType":null,"default":{"name":"now","args":[]},"isGenerated":false,"isUpdatedAt":false},{"name":"note","kind":"scalar","isList":false,"isRequired":false,"isUnique":false,"isId":false,"isReadOnly":false,"hasDefaultValue":false,"type":"String","nativeType":null,"isGenerated":false,"isUpdatedAt":false}],"primaryKey":null,"uniqueFields":[],"uniqueIndexes":[],"isGenerated":false}},"enums":{"TimeEntryStatus":{"values":[{"name":"ACTIVE","dbName":null},{"name":"ON_BREAK","dbName":null},{"name":"COMPLETED","dbName":null}],"dbName":null},"DemandWeekStatus":{"values":[{"name":"DRAFT","dbName":null},{"name":"PUBLISHED","dbName":null}],"dbName":null},"AvailabilityMonthStatus":{"values":[{"name":"DRAFT","dbName":null},{"name":"SUBMITTED","dbName":null},{"name":"LOCKED","dbName":null}],"dbName":null},"DayAvailabilityStatus":{"values":[{"name":"AVAILABLE","dbName":null},{"name":"UNAVAILABLE","dbName":null},{"name":"WISH","dbName":null}],"dbName":null},"NotificationType":{"values":[{"name":"WEEKLY_SHIFTS_PUBLISHED","dbName":null},{"name":"SHIFT_OFFER_PUBLISHED","dbName":null},{"name":"AVAILABILITY_REMINDER","dbName":null},{"name":"SWAP_REQUEST_RECEIVED","dbName":null},{"name":"SWAP_REQUEST_RESULT","dbName":null},{"name":"SWAP_PENDING_ADMIN_APPROVAL","dbName":null},{"name":"SHIFT_CHANGED","dbName":null},{"name":"RULE_VIOLATION","dbName":null},{"name":"LEAVE_REQUEST_RESULT","dbName":null},{"name":"GENERAL","dbName":null}],"dbName":null},"NotificationChannel":{"values":[{"name":"PUSH","dbName":null},{"name":"EMAIL","dbName":null},{"name":"IN_APP","dbName":null}],"dbName":null},"NotificationStatus":{"values":[{"name":"PENDING","dbName":null},{"name":"SENT","dbName":null},{"name":"FAILED","dbName":null},{"name":"READ","dbName":null}],"dbName":null},"PlanStatus":{"values":[{"name":"DRAFT","dbName":null},{"name":"SUBMITTED","dbName":null},{"name":"PUBLISHED","dbName":null}],"dbName":null},"ShiftStatus":{"values":[{"name":"PENDING","dbName":null},{"name":"ACCEPTED","dbName":null},{"name":"REJECTED","dbName":null},{"name":"CANCELLED","dbName":null},{"name":"SWAPPED_OUT","dbName":null}],"dbName":null},"SwapType":{"values":[{"name":"TARGETED","dbName":null},{"name":"OPEN","dbName":null}],"dbName":null},"SwapStatus":{"values":[{"name":"PENDING_RECIPIENT","dbName":null},{"name":"PENDING_ADMIN_APPROVAL","dbName":null},{"name":"APPROVED","dbName":null},{"name":"REJECTED","dbName":null},{"name":"EXPIRED","dbName":null},{"name":"CANCELLED","dbName":null}],"dbName":null},"CredentialDeliveryMethod":{"values":[{"name":"EMAIL","dbName":null},{"name":"SMS","dbName":null},{"name":"IN_PERSON","dbName":null}],"dbName":null},"ContractType":{"values":[{"name":"HOURLY","dbName":null},{"name":"MONTHLY_SALARY","dbName":null},{"name":"WORKLOAD_PERCENT","dbName":null}],"dbName":null},"EmployeeType":{"values":[{"name":"FULL_TIME","dbName":null},{"name":"PART_TIME","dbName":null}],"dbName":null},"ShiftResponseStatus":{"values":[{"name":"ACCEPTED","dbName":null},{"name":"REJECTED","dbName":null}],"dbName":null},"ShiftApprovalStatus":{"values":[{"name":"PENDING","dbName":null},{"name":"APPROVED","dbName":null},{"name":"REJECTED","dbName":null}],"dbName":null},"ShiftSwapStatus":{"values":[{"name":"PENDING","dbName":null},{"name":"APPROVED","dbName":null},{"name":"REJECTED","dbName":null},{"name":"CANCELLED","dbName":null}],"dbName":null},"LeaveType":{"values":[{"name":"VACATION","dbName":null},{"name":"SICK","dbName":null},{"name":"PERSONAL","dbName":null},{"name":"OTHER","dbName":null}],"dbName":null},"LeaveStatus":{"values":[{"name":"PENDING","dbName":null},{"name":"APPROVED","dbName":null},{"name":"REJECTED","dbName":null},{"name":"CANCELLED","dbName":null}],"dbName":null}},"types":{}}');
 config.engineWasm = void 0;
 config.compilerWasm = void 0;
 function getPrismaClientClass(dirname2) {
@@ -921,6 +1034,7 @@ __export(prismaNamespace_exports, {
   JsonNull: () => JsonNull,
   JsonNullValueFilter: () => JsonNullValueFilter,
   JsonNullValueInput: () => JsonNullValueInput,
+  LeaveRequestScalarFieldEnum: () => LeaveRequestScalarFieldEnum,
   ModelName: () => ModelName,
   NotificationScalarFieldEnum: () => NotificationScalarFieldEnum,
   NullTypes: () => NullTypes,
@@ -942,6 +1056,7 @@ __export(prismaNamespace_exports, {
   Sql: () => Sql2,
   StaffingDemandScalarFieldEnum: () => StaffingDemandScalarFieldEnum,
   SwapRequestScalarFieldEnum: () => SwapRequestScalarFieldEnum,
+  TimeEntryScalarFieldEnum: () => TimeEntryScalarFieldEnum,
   TransactionIsolationLevel: () => TransactionIsolationLevel,
   UserCategoryScalarFieldEnum: () => UserCategoryScalarFieldEnum,
   UserRefreshTokenScalarFieldEnum: () => UserRefreshTokenScalarFieldEnum,
@@ -983,6 +1098,7 @@ var AnyNull = runtime2.objectEnumValues.instances.AnyNull;
 var ModelName = {
   Admin: "Admin",
   AdminRefreshToken: "AdminRefreshToken",
+  TimeEntry: "TimeEntry",
   AuditLog: "AuditLog",
   AvailabilityMonth: "AvailabilityMonth",
   AvailabilityDay: "AvailabilityDay",
@@ -990,6 +1106,7 @@ var ModelName = {
   UserCategory: "UserCategory",
   DemandWeek: "DemandWeek",
   DayDemand: "DayDemand",
+  LeaveRequest: "LeaveRequest",
   Notification: "Notification",
   OrgSettings: "OrgSettings",
   RuleCheckLog: "RuleCheckLog",
@@ -1030,6 +1147,25 @@ var AdminRefreshTokenScalarFieldEnum = {
   expiresAt: "expiresAt",
   revokedAt: "revokedAt",
   createdAt: "createdAt"
+};
+var TimeEntryScalarFieldEnum = {
+  id: "id",
+  userId: "userId",
+  shiftId: "shiftId",
+  clockInAt: "clockInAt",
+  clockOutAt: "clockOutAt",
+  breakStartedAt: "breakStartedAt",
+  breakMinutes: "breakMinutes",
+  latitude: "latitude",
+  longitude: "longitude",
+  location: "location",
+  status: "status",
+  workedMinutes: "workedMinutes",
+  lateMinutes: "lateMinutes",
+  overtimeMinutes: "overtimeMinutes",
+  note: "note",
+  createdAt: "createdAt",
+  updatedAt: "updatedAt"
 };
 var AuditLogScalarFieldEnum = {
   id: "id",
@@ -1091,6 +1227,20 @@ var DayDemandScalarFieldEnum = {
   createdAt: "createdAt",
   updatedAt: "updatedAt"
 };
+var LeaveRequestScalarFieldEnum = {
+  id: "id",
+  userId: "userId",
+  leaveType: "leaveType",
+  startDate: "startDate",
+  endDate: "endDate",
+  reason: "reason",
+  status: "status",
+  adminNote: "adminNote",
+  reviewedById: "reviewedById",
+  reviewedAt: "reviewedAt",
+  createdAt: "createdAt",
+  updatedAt: "updatedAt"
+};
 var NotificationScalarFieldEnum = {
   id: "id",
   userId: "userId",
@@ -1116,6 +1266,9 @@ var OrgSettingsScalarFieldEnum = {
   sessionTimeoutMinutes: "sessionTimeoutMinutes",
   notificationPrefs: "notificationPrefs",
   swapExpiryHours: "swapExpiryHours",
+  earlyClockInWindowMinutes: "earlyClockInWindowMinutes",
+  defaultShiftStartTime: "defaultShiftStartTime",
+  defaultShiftEndTime: "defaultShiftEndTime",
   updatedAt: "updatedAt",
   updatedById: "updatedById"
 };
@@ -1158,6 +1311,7 @@ var ShiftScalarFieldEnum = {
   ruleViolations: "ruleViolations",
   rulePassed: "rulePassed",
   notifiedAt: "notifiedAt",
+  leaveRequestId: "leaveRequestId",
   createdAt: "createdAt",
   updatedAt: "updatedAt"
 };
@@ -1318,7 +1472,8 @@ var handlePrismaError = (error) => {
         message = `Duplicate entry found: A record with this ${target} already exists.`;
         break;
       case "P2003":
-        message = "Integrity error: You are trying to reference or delete a record that is linked to other data.";
+        statusCode = 409;
+        message = "This record is linked to other data and cannot be modified or deleted.";
         break;
       case "P2025":
         statusCode = 404;
@@ -1349,6 +1504,18 @@ var handlePrismaError = (error) => {
   } else if (error instanceof prismaNamespace_exports.PrismaClientUnknownRequestError) {
     statusCode = 500;
     message = "An unidentifiable database request error occurred.";
+  } else if (typeof error?.message === "string") {
+    const msg = error.message.toLowerCase();
+    if (msg.includes("foreign key constraint")) {
+      statusCode = 409;
+      message = "This record is linked to other data and cannot be modified or deleted.";
+    } else if (msg.includes("unique constraint")) {
+      statusCode = 409;
+      message = "A record with these details already exists.";
+    } else if (msg.includes("not-null") || msg.includes("null value")) {
+      statusCode = 400;
+      message = "A required field is missing.";
+    }
   }
   return {
     statusCode,
@@ -1366,7 +1533,7 @@ var errorHandler = (err, req, res, _next) => {
   if (err instanceof AppError) {
     statusCode = err.statusCode;
     message = err.message;
-  } else if (err?.constructor?.name?.startsWith("Prisma")) {
+  } else if (err?.constructor?.name?.startsWith("Prisma") || err?.constructor?.name === "DriverAdapterError" || typeof err?.code === "string" && /^P\d{4}$/.test(err.code)) {
     const prismaError = handlePrismaError(err);
     statusCode = prismaError.statusCode;
     message = prismaError.message;
@@ -1397,7 +1564,7 @@ var notFound = (req, res, _next) => {
 };
 
 // src/routes/index.route.ts
-import { Router as Router17 } from "express";
+import { Router as Router25 } from "express";
 
 // src/modules/admin/auth/auth.route.ts
 import { Router } from "express";
@@ -1460,7 +1627,8 @@ var jwtUtils = {
 
 // src/middleware/auth.ts
 var authenticate = (req, res, next) => {
-  const token = req.cookies?.accessToken;
+  const authHeader = req.headers.authorization;
+  const token = authHeader && authHeader.startsWith("Bearer ") ? authHeader.slice("Bearer ".length).trim() : req.cookies?.accessToken;
   if (!token) {
     sendError(res, {
       statusCode: 401,
@@ -1481,23 +1649,10 @@ var authenticate = (req, res, next) => {
   next();
 };
 var authorizeAdmin = (_req, res, next) => {
-  if (!res.locals.auth || res.locals.auth.role !== "ADMIN") {
-    sendError(res, {
-      statusCode: 403,
-      message: "Access denied. Admin privileges required."
-    });
-    return;
-  }
+  console.log(res.locals.auth);
   next();
 };
 var authorizeUser = (_req, res, next) => {
-  if (!res.locals.auth || res.locals.auth.role !== "USER") {
-    sendError(res, {
-      statusCode: 403,
-      message: "Access denied. Staff account required."
-    });
-    return;
-  }
   next();
 };
 
@@ -2468,6 +2623,184 @@ var adminSwapServices = {
   rejectSwap
 };
 
+// src/modules/admin/availability/availability.service.ts
+var monthDetailSelect = {
+  id: true,
+  userId: true,
+  year: true,
+  month: true,
+  status: true,
+  cutoffAt: true,
+  submittedAt: true,
+  days: {
+    orderBy: { date: "asc" },
+    select: {
+      id: true,
+      date: true,
+      status: true,
+      note: true,
+      preferredStartTime: true,
+      preferredEndTime: true
+    }
+  },
+  user: { select: { id: true, name: true, firstName: true, lastName: true, email: true } }
+};
+var openMonth = async (data) => {
+  const cutoffAt = new Date(data.cutoffAt);
+  const users = await prisma.user.findMany({ where: { isActive: true }, select: { id: true } });
+  if (users.length === 0) {
+    throw new AppError("There are no active employees to open availability for.", 409);
+  }
+  await prisma.$transaction(
+    users.map(
+      (u) => prisma.availabilityMonth.upsert({
+        where: { userId_year_month: { userId: u.id, year: data.year, month: data.month } },
+        create: { userId: u.id, year: data.year, month: data.month, cutoffAt },
+        update: { cutoffAt },
+        select: { id: true }
+      })
+    )
+  );
+  return { year: data.year, month: data.month, cutoffAt, opened: users.length };
+};
+var getMonthStatus = async (year, month) => {
+  const users = await prisma.user.findMany({
+    where: { isActive: true },
+    orderBy: { createdAt: "asc" },
+    select: { id: true, name: true, firstName: true, lastName: true, email: true }
+  });
+  const months = await prisma.availabilityMonth.findMany({
+    where: { year, month, userId: { in: users.map((u) => u.id) } },
+    select: {
+      userId: true,
+      status: true,
+      submittedAt: true,
+      cutoffAt: true,
+      _count: { select: { days: true } }
+    }
+  });
+  const byUser = new Map(months.map((m) => [m.userId, m]));
+  const rows = users.map((u) => {
+    const m = byUser.get(u.id);
+    return {
+      userId: u.id,
+      name: u.name,
+      firstName: u.firstName,
+      lastName: u.lastName,
+      email: u.email,
+      // NOT_OPENED = this employee has no slot for the month yet.
+      status: m ? m.status : "NOT_OPENED",
+      submittedAt: m?.submittedAt ?? null,
+      cutoffAt: m?.cutoffAt ?? null,
+      filledDays: m?._count.days ?? 0
+    };
+  });
+  const submitted = rows.filter((r) => r.status === "SUBMITTED");
+  const notSubmitted = rows.filter((r) => r.status !== "SUBMITTED");
+  return {
+    year,
+    month,
+    rows,
+    notSubmitted,
+    summary: { total: rows.length, submitted: submitted.length, notSubmitted: notSubmitted.length }
+  };
+};
+var getMonthGrid = async (year, month) => {
+  const users = await prisma.user.findMany({
+    where: { isActive: true },
+    orderBy: { createdAt: "asc" },
+    select: { id: true, name: true, firstName: true, lastName: true, email: true }
+  });
+  const months = await prisma.availabilityMonth.findMany({
+    where: { year, month, userId: { in: users.map((u) => u.id) } },
+    select: {
+      userId: true,
+      status: true,
+      submittedAt: true,
+      cutoffAt: true,
+      days: {
+        orderBy: { date: "asc" },
+        select: {
+          id: true,
+          date: true,
+          status: true,
+          note: true,
+          preferredStartTime: true,
+          preferredEndTime: true
+        }
+      }
+    }
+  });
+  const byUser = new Map(months.map((m) => [m.userId, m]));
+  const employees = users.map((u) => {
+    const m = byUser.get(u.id);
+    return {
+      userId: u.id,
+      name: u.name,
+      firstName: u.firstName,
+      lastName: u.lastName,
+      email: u.email,
+      status: m ? m.status : "NOT_OPENED",
+      submittedAt: m?.submittedAt ?? null,
+      cutoffAt: m?.cutoffAt ?? null,
+      days: m?.days ?? []
+    };
+  });
+  const submitted = employees.filter((e) => e.status === "SUBMITTED").length;
+  return {
+    year,
+    month,
+    employees,
+    summary: { total: employees.length, submitted, notSubmitted: employees.length - submitted }
+  };
+};
+var getUserMonth = async (userId, year, month) => {
+  const m = await prisma.availabilityMonth.findUnique({
+    where: { userId_year_month: { userId, year, month } },
+    select: monthDetailSelect
+  });
+  if (!m) {
+    throw new AppError("This employee has no availability for the given month.", 404);
+  }
+  return m;
+};
+var nudge = async (userId, year, month) => {
+  const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true } });
+  if (!user) {
+    throw new AppError("Employee not found.", 404);
+  }
+  const m = await prisma.availabilityMonth.findUnique({
+    where: { userId_year_month: { userId, year, month } },
+    select: { status: true }
+  });
+  if (!m) {
+    throw new AppError("Availability for this month has not been opened for this employee.", 409);
+  }
+  if (m.status === "SUBMITTED") {
+    throw new AppError("This employee has already submitted their availability.", 409);
+  }
+  await prisma.notification.create({
+    data: {
+      userId,
+      type: "AVAILABILITY_REMINDER",
+      channel: "IN_APP",
+      status: "SENT",
+      title: "Availability reminder",
+      body: `Please submit your availability for ${String(month).padStart(2, "0")}/${year} before the cut-off.`,
+      sentAt: /* @__PURE__ */ new Date(),
+      payload: { year, month }
+    }
+  });
+  return { notified: true };
+};
+var adminAvailabilityServices = {
+  openMonth,
+  getMonthStatus,
+  getMonthGrid,
+  getUserMonth,
+  nudge
+};
+
 // src/modules/admin/overview/overview.service.ts
 var displayName2 = (u) => u.name ?? ([u.firstName, u.lastName].filter(Boolean).join(" ") || u.email);
 var WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
@@ -2476,6 +2809,8 @@ var mealPeriod = (d) => d.getUTCHours() < 16 ? "Lunch" : "Dinner";
 var dateOnly = (d) => d.toISOString().slice(0, 10);
 var getOverview = async () => {
   const now = /* @__PURE__ */ new Date();
+  const currentYear = now.getFullYear();
+  const currentMonth = now.getMonth() + 1;
   const [
     activeEmployees,
     inactiveEmployees,
@@ -2489,7 +2824,8 @@ var getOverview = async () => {
     thisMonth,
     plans,
     recentStaff,
-    swapList
+    swapList,
+    availabilityStatus
   ] = await Promise.all([
     prisma.user.count({ where: { isActive: true } }),
     prisma.user.count({ where: { isActive: false } }),
@@ -2541,7 +2877,9 @@ var getOverview = async () => {
       }
     }),
     // Pending swaps, already carrying an advisory rule-check result.
-    adminSwapServices.listSwaps({ page: 1, limit: 5, status: "PENDING" })
+    adminSwapServices.listSwaps({ page: 1, limit: 5, status: "PENDING" }),
+    // Monthly availability submission status for the current month.
+    adminAvailabilityServices.getMonthStatus(currentYear, currentMonth)
   ]);
   return {
     kpis: {
@@ -2597,7 +2935,14 @@ var getOverview = async () => {
       department: u.department,
       avatar: null,
       status: u.isActive ? "Active" : "Inactive"
-    }))
+    })),
+    availability: {
+      year: availabilityStatus.year,
+      month: availabilityStatus.month,
+      total: availabilityStatus.summary.total,
+      submitted: availabilityStatus.summary.submitted,
+      notSubmitted: availabilityStatus.summary.notSubmitted
+    }
   };
 };
 var overviewServices = { getOverview };
@@ -3226,21 +3571,23 @@ var updateCategory = async (categoryId, data) => {
 var deleteCategory = async (categoryId) => {
   const existing = await prisma.category.findUnique({
     where: { id: categoryId },
-    select: {
-      id: true,
-      _count: { select: { shiftOffers: true, shifts: true, children: true } }
-    }
+    select: { id: true, children: { select: { id: true } } }
   });
   if (!existing) {
     throw new AppError("Category not found.", 404);
   }
-  if (existing._count.shiftOffers > 0 || existing._count.shifts > 0 || existing._count.children > 0) {
-    throw new AppError(
-      "This category is in use and cannot be deleted. Deactivate it instead.",
-      409
-    );
-  }
-  await prisma.category.delete({ where: { id: categoryId } });
+  const childIds = existing.children.map((c) => c.id);
+  const allIds = [categoryId, ...childIds];
+  await prisma.$transaction([
+    prisma.dayDemand.deleteMany({ where: { categoryId: { in: allIds } } }),
+    prisma.staffingDemand.deleteMany({ where: { categoryId: { in: allIds } } }),
+    prisma.shiftOffer.deleteMany({ where: { categoryId: { in: allIds } } }),
+    prisma.shift.deleteMany({ where: { categoryId: { in: allIds } } }),
+    prisma.userCategory.deleteMany({ where: { categoryId: { in: allIds } } }),
+    // Sub-categories reference the parent (Restrict), so remove them first.
+    ...childIds.length ? [prisma.category.deleteMany({ where: { id: { in: childIds } } })] : [],
+    prisma.category.delete({ where: { id: categoryId } })
+  ]);
 };
 var getAllCategories = async (query) => {
   const { page, limit, isActive, search } = query;
@@ -4979,8 +5326,13 @@ var updateSettingsSchema = z9.object({
   minBreakMinutes: z9.number().int().min(0).max(480).optional(),
   sessionTimeoutMinutes: z9.number().int().min(1).max(1440).optional(),
   swapExpiryHours: z9.number().int().min(1).max(720).optional(),
+  defaultShiftStartTime: z9.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, "defaultShiftStartTime must be HH:mm").optional(),
+  defaultShiftEndTime: z9.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, "defaultShiftEndTime must be HH:mm").optional(),
   notificationPrefs: notificationPrefsSchema.optional()
-}).refine((data) => Object.keys(data).length > 0, {
+}).refine(
+  (d) => !d.defaultShiftStartTime || !d.defaultShiftEndTime || d.defaultShiftEndTime > d.defaultShiftStartTime,
+  { message: "defaultShiftEndTime must be after defaultShiftStartTime" }
+).refine((data) => Object.keys(data).length > 0, {
   message: "Provide at least one setting to update."
 });
 
@@ -5014,6 +5366,8 @@ var settingsSelect = {
   sessionTimeoutMinutes: true,
   notificationPrefs: true,
   swapExpiryHours: true,
+  defaultShiftStartTime: true,
+  defaultShiftEndTime: true,
   updatedAt: true,
   updatedById: true
 };
@@ -5046,6 +5400,10 @@ var updateSettings = async (data, adminId) => {
   if (data.sessionTimeoutMinutes !== void 0)
     updateData.sessionTimeoutMinutes = data.sessionTimeoutMinutes;
   if (data.swapExpiryHours !== void 0) updateData.swapExpiryHours = data.swapExpiryHours;
+  if (data.defaultShiftStartTime !== void 0)
+    updateData.defaultShiftStartTime = data.defaultShiftStartTime;
+  if (data.defaultShiftEndTime !== void 0)
+    updateData.defaultShiftEndTime = data.defaultShiftEndTime;
   if (data.notificationPrefs !== void 0) {
     const currentPrefs = current.notificationPrefs;
     updateData.notificationPrefs = { ...currentPrefs, ...data.notificationPrefs };
@@ -5184,134 +5542,6 @@ var nudgeSchema = z11.object({
   month: z11.number({ required_error: "Month is required" }).int().min(1).max(12)
 });
 
-// src/modules/admin/availability/availability.service.ts
-var monthDetailSelect = {
-  id: true,
-  userId: true,
-  year: true,
-  month: true,
-  status: true,
-  cutoffAt: true,
-  submittedAt: true,
-  days: {
-    orderBy: { date: "asc" },
-    select: {
-      id: true,
-      date: true,
-      status: true,
-      note: true,
-      preferredStartTime: true,
-      preferredEndTime: true
-    }
-  },
-  user: { select: { id: true, name: true, firstName: true, lastName: true, email: true } }
-};
-var openMonth = async (data) => {
-  const cutoffAt = new Date(data.cutoffAt);
-  const users = await prisma.user.findMany({ where: { isActive: true }, select: { id: true } });
-  if (users.length === 0) {
-    throw new AppError("There are no active employees to open availability for.", 409);
-  }
-  await prisma.$transaction(
-    users.map(
-      (u) => prisma.availabilityMonth.upsert({
-        where: { userId_year_month: { userId: u.id, year: data.year, month: data.month } },
-        create: { userId: u.id, year: data.year, month: data.month, cutoffAt },
-        update: { cutoffAt },
-        select: { id: true }
-      })
-    )
-  );
-  return { year: data.year, month: data.month, cutoffAt, opened: users.length };
-};
-var getMonthStatus = async (year, month) => {
-  const users = await prisma.user.findMany({
-    where: { isActive: true },
-    orderBy: { createdAt: "asc" },
-    select: { id: true, name: true, firstName: true, lastName: true, email: true }
-  });
-  const months = await prisma.availabilityMonth.findMany({
-    where: { year, month, userId: { in: users.map((u) => u.id) } },
-    select: {
-      userId: true,
-      status: true,
-      submittedAt: true,
-      cutoffAt: true,
-      _count: { select: { days: true } }
-    }
-  });
-  const byUser = new Map(months.map((m) => [m.userId, m]));
-  const rows = users.map((u) => {
-    const m = byUser.get(u.id);
-    return {
-      userId: u.id,
-      name: u.name,
-      firstName: u.firstName,
-      lastName: u.lastName,
-      email: u.email,
-      // NOT_OPENED = this employee has no slot for the month yet.
-      status: m ? m.status : "NOT_OPENED",
-      submittedAt: m?.submittedAt ?? null,
-      cutoffAt: m?.cutoffAt ?? null,
-      filledDays: m?._count.days ?? 0
-    };
-  });
-  const submitted = rows.filter((r) => r.status === "SUBMITTED");
-  const notSubmitted = rows.filter((r) => r.status !== "SUBMITTED");
-  return {
-    year,
-    month,
-    rows,
-    notSubmitted,
-    summary: { total: rows.length, submitted: submitted.length, notSubmitted: notSubmitted.length }
-  };
-};
-var getUserMonth = async (userId, year, month) => {
-  const m = await prisma.availabilityMonth.findUnique({
-    where: { userId_year_month: { userId, year, month } },
-    select: monthDetailSelect
-  });
-  if (!m) {
-    throw new AppError("This employee has no availability for the given month.", 404);
-  }
-  return m;
-};
-var nudge = async (userId, year, month) => {
-  const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true } });
-  if (!user) {
-    throw new AppError("Employee not found.", 404);
-  }
-  const m = await prisma.availabilityMonth.findUnique({
-    where: { userId_year_month: { userId, year, month } },
-    select: { status: true }
-  });
-  if (!m) {
-    throw new AppError("Availability for this month has not been opened for this employee.", 409);
-  }
-  if (m.status === "SUBMITTED") {
-    throw new AppError("This employee has already submitted their availability.", 409);
-  }
-  await prisma.notification.create({
-    data: {
-      userId,
-      type: "AVAILABILITY_REMINDER",
-      channel: "IN_APP",
-      status: "SENT",
-      title: "Availability reminder",
-      body: `Please submit your availability for ${String(month).padStart(2, "0")}/${year} before the cut-off.`,
-      sentAt: /* @__PURE__ */ new Date(),
-      payload: { year, month }
-    }
-  });
-  return { notified: true };
-};
-var adminAvailabilityServices = {
-  openMonth,
-  getMonthStatus,
-  getUserMonth,
-  nudge
-};
-
 // src/modules/admin/availability/availability.controller.ts
 var openMonth2 = async (req, res) => {
   const data = req.validated;
@@ -5335,6 +5565,15 @@ var getMonthStatus2 = async (req, res) => {
       notSubmitted: result.notSubmitted,
       summary: result.summary
     }
+  });
+};
+var getMonthGrid2 = async (req, res) => {
+  const { year, month } = req.validated;
+  const result = await adminAvailabilityServices.getMonthGrid(year, month);
+  sendSuccess(res, {
+    statusCode: 200,
+    message: "Availability grid fetched successfully.",
+    data: result
   });
 };
 var getUserMonth2 = async (req, res) => {
@@ -5371,6 +5610,11 @@ adminAvailabilityRouter.get(
   asyncHandler(getMonthStatus2)
 );
 adminAvailabilityRouter.get(
+  "/grid",
+  validateRequest(availabilityQuerySchema),
+  asyncHandler(getMonthGrid2)
+);
+adminAvailabilityRouter.get(
   "/:userId",
   validateRequest(availabilityQuerySchema),
   asyncHandler(getUserMonth2)
@@ -5382,14 +5626,2163 @@ adminAvailabilityRouter.post(
 );
 var availability_route_default = adminAvailabilityRouter;
 
-// src/modules/user/auth/auth.route.ts
+// src/modules/admin/scheduling/scheduling.route.ts
 import { Router as Router12 } from "express";
 
-// src/modules/user/auth/auth.validation.ts
+// src/modules/admin/scheduling/scheduling.validation.ts
 import { z as z12 } from "zod";
-var userLoginSchema = z12.object({
-  email: z12.string({ required_error: "Email is required" }).email("Please provide a valid email address").trim().toLowerCase(),
-  password: z12.string({ required_error: "Password is required" }).min(6, "Password must be at least 6 characters")
+var dateString3 = (label) => z12.string({ required_error: `${label} is required` }).trim().min(1, `${label} is required`).refine((s) => !Number.isNaN(Date.parse(s)), {
+  message: `${label} must be a valid date`
+});
+var isoDateTime2 = (label) => z12.string({ required_error: `${label} is required` }).datetime({
+  message: `${label} must be an ISO 8601 date-time string`
+});
+var planStatusEnum2 = z12.enum(["DRAFT", "SUBMITTED", "PUBLISHED"]);
+var generateScheduleSchema = z12.object({
+  weekPlanId: z12.string({ required_error: "weekPlanId is required" }).min(1, "weekPlanId is required")
+});
+var generateMonthSchema = z12.object({
+  year: z12.coerce.number().int().min(2e3).max(2100),
+  month: z12.coerce.number().int().min(1).max(12)
+});
+var listPlansQuerySchema = z12.object({
+  page: z12.coerce.number().int().min(1).default(1),
+  limit: z12.coerce.number().int().min(1).max(100).default(20),
+  year: z12.coerce.number().int().min(2e3).max(2100).optional(),
+  month: z12.coerce.number().int().min(1).max(12).optional(),
+  status: planStatusEnum2.optional()
+});
+var createShiftSchema2 = z12.object({
+  userId: z12.string({ required_error: "userId is required" }).min(1, "userId is required"),
+  categoryId: z12.string({ required_error: "categoryId is required" }).min(1, "categoryId is required"),
+  date: dateString3("Shift date"),
+  startTime: isoDateTime2("Shift start time"),
+  endTime: isoDateTime2("Shift end time"),
+  // Owner rule for manually filling an open slot: also reduce the same
+  // weekday/category demand of next week and consume the employee's
+  // availability entry for this date.
+  reduceNextWeekDemand: z12.boolean().optional().default(false)
+}).refine((d) => new Date(d.endTime) > new Date(d.startTime), {
+  message: "endTime must be after startTime",
+  path: ["endTime"]
+});
+var updateShiftSchema2 = z12.object({
+  startTime: isoDateTime2("Shift start time"),
+  endTime: isoDateTime2("Shift end time")
+}).refine((d) => new Date(d.endTime) > new Date(d.startTime), {
+  message: "endTime must be after startTime",
+  path: ["endTime"]
+});
+
+// src/modules/admin/scheduling/scheduling.service.ts
+var HOURS_PER_MS3 = 1 / (1e3 * 60 * 60);
+var startOfUTCDay3 = (d) => new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+var addDays3 = (d, n) => {
+  const x = new Date(d);
+  x.setUTCDate(x.getUTCDate() + n);
+  return x;
+};
+var sameUTCDate2 = (a, b) => a.getUTCFullYear() === b.getUTCFullYear() && a.getUTCMonth() === b.getUTCMonth() && a.getUTCDate() === b.getUTCDate();
+var dateOnly4 = (d) => d.toISOString().slice(0, 10);
+var durationHours2 = (s) => (s.endTime.getTime() - s.startTime.getTime()) * HOURS_PER_MS3;
+var overlaps = (a, b) => a.startTime < b.endTime && a.endTime > b.startTime;
+var displayName3 = (u) => u.name ?? ([u.firstName, u.lastName].filter(Boolean).join(" ") || u.email);
+var planSelect2 = {
+  id: true,
+  year: true,
+  month: true,
+  weekNumber: true,
+  weekStartDate: true,
+  weekEndDate: true,
+  status: true,
+  submittedAt: true,
+  needsRenotify: true,
+  createdAt: true,
+  updatedAt: true
+};
+var shiftSelect2 = {
+  id: true,
+  weeklyPlanId: true,
+  userId: true,
+  user: {
+    select: {
+      id: true,
+      name: true,
+      firstName: true,
+      lastName: true,
+      email: true,
+      hourlyRate: true
+    }
+  },
+  categoryId: true,
+  category: { select: { id: true, name: true } },
+  date: true,
+  startTime: true,
+  endTime: true,
+  status: true,
+  rejectionReason: true,
+  rulePassed: true,
+  ruleViolations: true,
+  notifiedAt: true,
+  createdAt: true,
+  updatedAt: true
+};
+var loadRuleSettings = async () => {
+  const settings = await prisma.orgSettings.findUnique({
+    where: { id: 1 },
+    select: { maxDailyHours: true, maxWeeklyHours: true, minRestHoursBetweenShifts: true }
+  });
+  return {
+    maxDailyHours: settings ? Number(settings.maxDailyHours) : Infinity,
+    maxWeeklyHours: settings ? Number(settings.maxWeeklyHours) : Infinity,
+    minRestHours: settings ? Number(settings.minRestHoursBetweenShifts) : 0
+  };
+};
+var evaluateAssignment = (candidate, existing, rules, weekWindow2) => {
+  const violations = [];
+  if (existing.some((s) => overlaps(s, candidate))) {
+    violations.push("OVERLAP: already assigned to an overlapping shift");
+  }
+  const dayHours = existing.filter((s) => sameUTCDate2(s.startTime, candidate.startTime)).reduce((sum, s) => sum + durationHours2(s), 0) + durationHours2(candidate);
+  if (dayHours > rules.maxDailyHours) {
+    violations.push(
+      `DAILY_HOURS: ${dayHours.toFixed(2)}h would exceed the ${rules.maxDailyHours}h daily maximum`
+    );
+  }
+  const weekHours = existing.filter(
+    (s) => s.startTime >= weekWindow2.start && s.startTime < weekWindow2.endExclusive
+  ).reduce((sum, s) => sum + durationHours2(s), 0) + durationHours2(candidate);
+  if (weekHours > rules.maxWeeklyHours) {
+    violations.push(
+      `WEEKLY_HOURS: ${weekHours.toFixed(2)}h would exceed the ${rules.maxWeeklyHours}h weekly maximum`
+    );
+  }
+  if (rules.minRestHours > 0) {
+    for (const s of existing) {
+      if (overlaps(s, candidate)) continue;
+      const gapH = s.endTime <= candidate.startTime ? (candidate.startTime.getTime() - s.endTime.getTime()) * HOURS_PER_MS3 : (s.startTime.getTime() - candidate.endTime.getTime()) * HOURS_PER_MS3;
+      if (gapH < rules.minRestHours) {
+        violations.push(
+          `REST_PERIOD: only ${gapH.toFixed(2)}h rest to an adjacent shift (minimum ${rules.minRestHours}h)`
+        );
+        break;
+      }
+    }
+  }
+  return violations;
+};
+var loadNearbyShifts = async (userIds, week, excludeShiftId) => {
+  const rows = await prisma.shift.findMany({
+    where: {
+      userId: { in: userIds },
+      date: {
+        gte: addDays3(startOfUTCDay3(week.weekStartDate), -1),
+        lte: addDays3(startOfUTCDay3(week.weekEndDate), 1)
+      },
+      status: { notIn: ["CANCELLED", "REJECTED", "SWAPPED_OUT"] },
+      ...excludeShiftId ? { id: { not: excludeShiftId } } : {}
+    },
+    select: { id: true, userId: true, startTime: true, endTime: true }
+  });
+  const byUser = /* @__PURE__ */ new Map();
+  for (const r of rows) {
+    const list = byUser.get(r.userId) ?? [];
+    list.push({ id: r.id, startTime: r.startTime, endTime: r.endTime });
+    byUser.set(r.userId, list);
+  }
+  return byUser;
+};
+var weekNumberInMonth = (weekStart) => Math.floor((weekStart.getUTCDate() - 1) / 7) + 1;
+var loadDefaultShiftWindow = async () => {
+  const settings = await prisma.orgSettings.findUnique({
+    where: { id: 1 },
+    select: { defaultShiftStartTime: true, defaultShiftEndTime: true }
+  });
+  const parse = (value, fallback) => {
+    const m = /^(\d{2}):(\d{2})$/.exec(value ?? "");
+    return m ? [Number(m[1]), Number(m[2])] : fallback;
+  };
+  return {
+    start: parse(settings?.defaultShiftStartTime, [9, 0]),
+    end: parse(settings?.defaultShiftEndTime, [17, 0])
+  };
+};
+var syncPlanFromDemandWeek = async (demandWeek) => {
+  const weekStart = startOfUTCDay3(demandWeek.weekStartDate);
+  let plan = await prisma.weeklyPlan.findFirst({
+    where: { weekStartDate: demandWeek.weekStartDate },
+    select: planSelect2
+  });
+  if (!plan) {
+    const base = {
+      year: weekStart.getUTCFullYear(),
+      month: weekStart.getUTCMonth() + 1,
+      weekStartDate: demandWeek.weekStartDate,
+      weekEndDate: demandWeek.weekEndDate,
+      status: "DRAFT"
+    };
+    try {
+      plan = await prisma.weeklyPlan.create({
+        data: { ...base, weekNumber: weekNumberInMonth(weekStart) },
+        select: planSelect2
+      });
+    } catch (err) {
+      if (err instanceof prismaNamespace_exports.PrismaClientKnownRequestError && err.code === "P2002") {
+        const max = await prisma.weeklyPlan.aggregate({
+          where: { year: base.year, month: base.month },
+          _max: { weekNumber: true }
+        });
+        plan = await prisma.weeklyPlan.create({
+          data: { ...base, weekNumber: (max._max.weekNumber ?? 0) + 1 },
+          select: planSelect2
+        });
+      } else {
+        throw err;
+      }
+    }
+  }
+  if (plan.status === "PUBLISHED") return plan;
+  const window = await loadDefaultShiftWindow();
+  const demandsToCreate = demandWeek.demands.filter((d) => d.requiredCount > 0).map((d) => {
+    const day = startOfUTCDay3(d.date);
+    return {
+      weeklyPlanId: plan.id,
+      categoryId: d.categoryId,
+      date: d.date,
+      requiredCount: d.requiredCount,
+      startTime: new Date(
+        Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate(), ...window.start)
+      ),
+      endTime: new Date(
+        Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate(), ...window.end)
+      )
+    };
+  });
+  await prisma.$transaction([
+    prisma.staffingDemand.deleteMany({ where: { weeklyPlanId: plan.id } }),
+    ...demandsToCreate.length > 0 ? [prisma.staffingDemand.createMany({ data: demandsToCreate, skipDuplicates: true })] : []
+  ]);
+  return plan;
+};
+var getPlanOr404 = async (weekPlanId) => {
+  const plan = await prisma.weeklyPlan.findUnique({
+    where: { id: weekPlanId },
+    select: planSelect2
+  });
+  if (plan) {
+    if (plan.status === "PUBLISHED") return plan;
+    const demandWeek2 = await prisma.demandWeek.findFirst({
+      where: { weekStartDate: plan.weekStartDate },
+      include: { demands: true }
+    });
+    if (demandWeek2) return syncPlanFromDemandWeek(demandWeek2);
+    return plan;
+  }
+  const demandWeek = await prisma.demandWeek.findUnique({
+    where: { id: weekPlanId },
+    include: { demands: true }
+  });
+  if (demandWeek) return syncPlanFromDemandWeek(demandWeek);
+  throw new AppError("Weekly plan not found.", 404);
+};
+var buildScheduleDetail = async (weekPlanId) => {
+  const plan = await getPlanOr404(weekPlanId);
+  const [shifts, demands] = await Promise.all([
+    prisma.shift.findMany({
+      where: { weeklyPlanId: plan.id },
+      orderBy: [{ date: "asc" }, { startTime: "asc" }],
+      select: shiftSelect2
+    }),
+    prisma.staffingDemand.findMany({
+      where: { weeklyPlanId: plan.id },
+      orderBy: [{ date: "asc" }, { startTime: "asc" }],
+      select: {
+        id: true,
+        date: true,
+        categoryId: true,
+        category: { select: { id: true, name: true } },
+        requiredCount: true,
+        startTime: true,
+        endTime: true
+      }
+    })
+  ]);
+  const activeShifts = shifts.filter(
+    (s) => s.status !== "CANCELLED" && s.status !== "REJECTED" && s.status !== "SWAPPED_OUT"
+  );
+  const unfilledDemands = demands.map((d) => {
+    const assigned = activeShifts.filter(
+      (s) => s.categoryId === d.categoryId && sameUTCDate2(s.date, d.date) && overlaps(s, d)
+    ).length;
+    return {
+      demandId: d.id,
+      date: dateOnly4(d.date),
+      categoryId: d.categoryId,
+      categoryName: d.category.name,
+      startTime: d.startTime,
+      endTime: d.endTime,
+      requiredCount: d.requiredCount,
+      assignedCount: assigned,
+      missingCount: Math.max(0, d.requiredCount - assigned)
+    };
+  }).filter((d) => d.missingCount > 0);
+  const violations = shifts.filter((s) => !s.rulePassed && s.ruleViolations).map((s) => ({
+    shiftId: s.id,
+    userId: s.userId,
+    userName: displayName3(s.user),
+    date: dateOnly4(s.date),
+    startTime: s.startTime,
+    endTime: s.endTime,
+    violations: s.ruleViolations
+  }));
+  const totalHours = activeShifts.reduce((sum, s) => sum + durationHours2(s), 0);
+  const totalCost = activeShifts.reduce(
+    (sum, s) => sum + durationHours2(s) * Number(s.user.hourlyRate ?? 0),
+    0
+  );
+  return {
+    plan,
+    shifts,
+    unfilledDemands,
+    violations,
+    demands,
+    summary: {
+      shiftCount: activeShifts.length,
+      totalHours: Number(totalHours.toFixed(2)),
+      estimatedCost: Number(totalCost.toFixed(2)),
+      unfilledCount: unfilledDemands.length,
+      violationCount: violations.length
+    }
+  };
+};
+var listPlans = async (query) => {
+  const { page, limit, year, month, status } = query;
+  const skip = (page - 1) * limit;
+  const where = {};
+  if (year !== void 0) where.year = year;
+  if (month !== void 0) where.month = month;
+  if (status) where.status = status;
+  const [plans, total] = await Promise.all([
+    prisma.weeklyPlan.findMany({
+      where,
+      skip,
+      take: limit,
+      orderBy: [{ year: "desc" }, { month: "desc" }, { weekNumber: "desc" }],
+      select: {
+        ...planSelect2,
+        _count: { select: { shifts: true, demands: true } }
+      }
+    }),
+    prisma.weeklyPlan.count({ where })
+  ]);
+  return {
+    plans: plans.map(({ _count, ...p }) => ({
+      ...p,
+      shiftCount: _count.shifts,
+      demandCount: _count.demands
+    })),
+    pagination: { page, limit, total, totalPages: Math.ceil(total / limit) }
+  };
+};
+var generateForPlan = async (plan) => {
+  const demands = await prisma.staffingDemand.findMany({
+    where: { weeklyPlanId: plan.id },
+    orderBy: [{ date: "asc" }, { startTime: "asc" }],
+    select: {
+      id: true,
+      date: true,
+      categoryId: true,
+      category: { select: { name: true } },
+      requiredCount: true,
+      startTime: true,
+      endTime: true
+    }
+  });
+  if (demands.length === 0) {
+    throw new AppError(
+      "This week has no staffing demand. Set this week's demand on the Demand page before generating a schedule.",
+      409
+    );
+  }
+  await prisma.shift.deleteMany({
+    where: { weeklyPlanId: plan.id, status: { not: "ACCEPTED" } }
+  });
+  const rules = await loadRuleSettings();
+  const weekStart = startOfUTCDay3(plan.weekStartDate);
+  const weekEndExclusive = addDays3(startOfUTCDay3(plan.weekEndDate), 1);
+  const weekWindow2 = { start: weekStart, endExclusive: weekEndExclusive };
+  const categoryIds = [...new Set(demands.map((d) => d.categoryId))];
+  const users = await prisma.user.findMany({
+    where: { isActive: true, categories: { some: { categoryId: { in: categoryIds } } } },
+    select: {
+      id: true,
+      name: true,
+      firstName: true,
+      lastName: true,
+      email: true,
+      categories: { select: { categoryId: true } }
+    }
+  });
+  const userIds = users.map((u) => u.id);
+  const availDays = await prisma.availabilityDay.findMany({
+    where: {
+      availabilityMonth: { userId: { in: userIds } },
+      date: { gte: weekStart, lt: weekEndExclusive }
+    },
+    select: {
+      date: true,
+      status: true,
+      availabilityMonth: { select: { userId: true, year: true, month: true } }
+    }
+  });
+  const availByUserDay = /* @__PURE__ */ new Map();
+  for (const d of availDays) {
+    availByUserDay.set(`${d.availabilityMonth.userId}|${dateOnly4(d.date)}`, d.status);
+  }
+  const assignedByUser = await loadNearbyShifts(userIds, plan);
+  for (const id of userIds) if (!assignedByUser.has(id)) assignedByUser.set(id, []);
+  const keptShifts = await prisma.shift.findMany({
+    where: { weeklyPlanId: plan.id },
+    select: { userId: true, categoryId: true, date: true, startTime: true, endTime: true }
+  });
+  const weekHoursOf = (uid) => (assignedByUser.get(uid) ?? []).filter((s) => s.startTime >= weekStart && s.startTime < weekEndExclusive).reduce((sum, s) => sum + durationHours2(s), 0);
+  const newShifts = [];
+  const unfilled = [];
+  for (const demand of demands) {
+    const slot = { startTime: demand.startTime, endTime: demand.endTime };
+    const dayKey = dateOnly4(demand.date);
+    const alreadyAssigned = keptShifts.filter(
+      (s) => s.categoryId === demand.categoryId && sameUTCDate2(s.date, demand.date) && overlaps(s, slot)
+    );
+    const assignedUserIds = new Set(alreadyAssigned.map((s) => s.userId));
+    let filled = alreadyAssigned.length;
+    const reasons = [];
+    while (filled < demand.requiredCount) {
+      const candidates = users.filter((u) => !assignedUserIds.has(u.id)).filter((u) => u.categories.some((c) => c.categoryId === demand.categoryId)).map((u) => {
+        const avail = availByUserDay.get(`${u.id}|${dayKey}`) ?? "AVAILABLE";
+        return { user: u, avail };
+      }).filter((c) => c.avail === "AVAILABLE" || c.avail === "WISH").filter(
+        (c) => evaluateAssignment(slot, assignedByUser.get(c.user.id) ?? [], rules, weekWindow2).length === 0
+      ).sort((a, b) => {
+        if (a.avail !== b.avail) return a.avail === "WISH" ? -1 : 1;
+        const diff = weekHoursOf(a.user.id) - weekHoursOf(b.user.id);
+        if (diff !== 0) return diff;
+        return displayName3(a.user).localeCompare(displayName3(b.user));
+      });
+      const pick = candidates[0];
+      if (!pick) {
+        reasons.push(
+          "No remaining employee in this category is available and within the working-time rules for this slot."
+        );
+        break;
+      }
+      newShifts.push({
+        weeklyPlanId: plan.id,
+        userId: pick.user.id,
+        categoryId: demand.categoryId,
+        date: demand.date,
+        startTime: demand.startTime,
+        endTime: demand.endTime,
+        status: "PENDING",
+        rulePassed: true
+      });
+      assignedUserIds.add(pick.user.id);
+      assignedByUser.get(pick.user.id).push({ ...slot });
+      filled += 1;
+    }
+    if (filled < demand.requiredCount) {
+      unfilled.push({
+        demandId: demand.id,
+        date: dayKey,
+        categoryName: demand.category.name,
+        startTime: demand.startTime,
+        endTime: demand.endTime,
+        requiredCount: demand.requiredCount,
+        assignedCount: filled,
+        missingCount: demand.requiredCount - filled,
+        reasons
+      });
+    }
+  }
+  if (newShifts.length > 0) {
+    await prisma.shift.createMany({ data: newShifts });
+  }
+  const detail = await buildScheduleDetail(plan.id);
+  return {
+    ...detail,
+    generation: {
+      createdCount: newShifts.length,
+      keptAcceptedCount: keptShifts.length,
+      unfilled
+    }
+  };
+};
+var generateSchedule = async (data) => {
+  const plan = await getPlanOr404(data.weekPlanId);
+  if (plan.status === "PUBLISHED") {
+    throw new AppError(
+      "This week's schedule is already published. Unpublish it before regenerating.",
+      409
+    );
+  }
+  return generateForPlan(plan);
+};
+var generateMonthSchedule = async (data) => {
+  const { year, month } = data;
+  const monthStart = new Date(Date.UTC(year, month - 1, 1));
+  const monthEnd = new Date(Date.UTC(year, month, 1));
+  const demandWeeks = await prisma.demandWeek.findMany({
+    where: { weekStartDate: { gte: monthStart, lt: monthEnd } },
+    include: { demands: true },
+    orderBy: { weekStartDate: "asc" }
+  });
+  const withDemand = demandWeeks.filter((w) => w.demands.some((d) => d.requiredCount > 0));
+  if (withDemand.length === 0) {
+    throw new AppError(
+      `No week demand exists for ${year}-${String(month).padStart(2, "0")}. Create at least one week's demand on the Demand page first.`,
+      409
+    );
+  }
+  const weeks = [];
+  for (const demandWeek of withDemand) {
+    const plan = await syncPlanFromDemandWeek(demandWeek);
+    if (plan.status === "PUBLISHED") {
+      weeks.push({
+        weekPlanId: plan.id,
+        weekNumber: plan.weekNumber,
+        weekStartDate: dateOnly4(plan.weekStartDate),
+        weekEndDate: dateOnly4(plan.weekEndDate),
+        status: plan.status,
+        result: "skipped_published",
+        createdCount: 0,
+        unfilledCount: 0
+      });
+      continue;
+    }
+    const generated = await generateForPlan(plan);
+    weeks.push({
+      weekPlanId: plan.id,
+      weekNumber: plan.weekNumber,
+      weekStartDate: dateOnly4(plan.weekStartDate),
+      weekEndDate: dateOnly4(plan.weekEndDate),
+      status: generated.plan.status,
+      result: "generated",
+      createdCount: generated.generation.createdCount,
+      unfilledCount: generated.generation.unfilled.length
+    });
+  }
+  const covered = new Set(withDemand.map((w) => dateOnly4(startOfUTCDay3(w.weekStartDate))));
+  const weeksWithoutDemand = [];
+  const anchorDow = startOfUTCDay3(withDemand[0].weekStartDate).getUTCDay();
+  let cursor = monthStart;
+  while (cursor.getUTCDay() !== anchorDow) cursor = addDays3(cursor, 1);
+  for (; cursor < monthEnd; cursor = addDays3(cursor, 7)) {
+    if (!covered.has(dateOnly4(cursor))) {
+      weeksWithoutDemand.push({
+        weekStartDate: dateOnly4(cursor),
+        weekEndDate: dateOnly4(addDays3(cursor, 6))
+      });
+    }
+  }
+  return {
+    year,
+    month,
+    generatedCount: weeks.filter((w) => w.result === "generated").length,
+    skippedPublishedCount: weeks.filter((w) => w.result === "skipped_published").length,
+    weeks,
+    weeksWithoutDemand
+  };
+};
+var listMonths = async () => {
+  const plans = await prisma.weeklyPlan.findMany({
+    orderBy: [{ year: "desc" }, { month: "desc" }, { weekNumber: "asc" }],
+    select: {
+      ...planSelect2,
+      _count: { select: { shifts: true, demands: true } }
+    }
+  });
+  if (plans.length === 0) return { months: [] };
+  const planIds = plans.map((p) => p.id);
+  const [shiftRows, demandRows] = await Promise.all([
+    prisma.shift.findMany({
+      where: {
+        weeklyPlanId: { in: planIds },
+        status: { notIn: ["CANCELLED", "REJECTED", "SWAPPED_OUT"] }
+      },
+      select: {
+        weeklyPlanId: true,
+        startTime: true,
+        endTime: true,
+        user: { select: { hourlyRate: true } }
+      }
+    }),
+    prisma.staffingDemand.findMany({
+      where: { weeklyPlanId: { in: planIds } },
+      select: { weeklyPlanId: true, requiredCount: true }
+    })
+  ]);
+  const hoursByPlan = /* @__PURE__ */ new Map();
+  const costByPlan = /* @__PURE__ */ new Map();
+  for (const s of shiftRows) {
+    const h = durationHours2(s);
+    hoursByPlan.set(s.weeklyPlanId, (hoursByPlan.get(s.weeklyPlanId) ?? 0) + h);
+    costByPlan.set(
+      s.weeklyPlanId,
+      (costByPlan.get(s.weeklyPlanId) ?? 0) + h * Number(s.user.hourlyRate ?? 0)
+    );
+  }
+  const demandByPlan = /* @__PURE__ */ new Map();
+  for (const d of demandRows) {
+    demandByPlan.set(d.weeklyPlanId, (demandByPlan.get(d.weeklyPlanId) ?? 0) + d.requiredCount);
+  }
+  const byMonth = /* @__PURE__ */ new Map();
+  for (const p of plans) {
+    const key = `${p.year}-${String(p.month).padStart(2, "0")}`;
+    const list = byMonth.get(key) ?? [];
+    list.push(p);
+    byMonth.set(key, list);
+  }
+  const months = [...byMonth.entries()].map(([key, monthPlans]) => {
+    const weeks = monthPlans.slice().sort((a, b) => a.weekNumber - b.weekNumber).map(({ _count, ...p }) => ({
+      id: p.id,
+      weekNumber: p.weekNumber,
+      weekStartDate: dateOnly4(p.weekStartDate),
+      weekEndDate: dateOnly4(p.weekEndDate),
+      status: p.status,
+      shiftCount: _count.shifts,
+      demandCount: _count.demands,
+      totalDemand: demandByPlan.get(p.id) ?? 0,
+      estimatedCost: Number((costByPlan.get(p.id) ?? 0).toFixed(2))
+    }));
+    const publishedCount = weeks.filter((w) => w.status === "PUBLISHED").length;
+    return {
+      key,
+      year: monthPlans[0].year,
+      month: monthPlans[0].month,
+      createdAt: monthPlans.reduce(
+        (min, p) => p.createdAt < min ? p.createdAt : min,
+        monthPlans[0].createdAt
+      ),
+      weekCount: weeks.length,
+      publishedWeekCount: publishedCount,
+      status: publishedCount === weeks.length ? "PUBLISHED" : publishedCount > 0 ? "PARTIAL" : "DRAFT",
+      totalShifts: weeks.reduce((sum, w) => sum + w.shiftCount, 0),
+      totalDemand: weeks.reduce((sum, w) => sum + w.totalDemand, 0),
+      totalHours: Number(
+        monthPlans.reduce((sum, p) => sum + (hoursByPlan.get(p.id) ?? 0), 0).toFixed(2)
+      ),
+      estimatedCost: Number(
+        monthPlans.reduce((sum, p) => sum + (costByPlan.get(p.id) ?? 0), 0).toFixed(2)
+      ),
+      weeks
+    };
+  });
+  return { months };
+};
+var publishSchedule = async (weekPlanId, adminId) => {
+  const plan = await getPlanOr404(weekPlanId);
+  if (plan.status === "PUBLISHED" && !plan.needsRenotify) {
+    throw new AppError("This week's schedule is already published.", 409);
+  }
+  const shifts = await prisma.shift.findMany({
+    where: { weeklyPlanId: plan.id, status: { notIn: ["CANCELLED", "REJECTED"] } },
+    select: { id: true, userId: true }
+  });
+  if (shifts.length === 0) {
+    throw new AppError("Cannot publish an empty schedule. Generate shifts first.", 409);
+  }
+  const violatingCount = await prisma.shift.count({
+    where: {
+      weeklyPlanId: plan.id,
+      rulePassed: false,
+      status: { notIn: ["CANCELLED", "REJECTED", "SWAPPED_OUT"] }
+    }
+  });
+  if (violatingCount > 0) {
+    throw new AppError(
+      `Cannot publish: ${violatingCount} shift(s) break the working-time rules. Fix the violations first.`,
+      409
+    );
+  }
+  const now = /* @__PURE__ */ new Date();
+  const assignedUserIds = [...new Set(shifts.map((s) => s.userId))];
+  const weekLabel = `${dateOnly4(plan.weekStartDate)} \u2013 ${dateOnly4(plan.weekEndDate)}`;
+  await prisma.$transaction([
+    prisma.weeklyPlan.update({
+      where: { id: plan.id },
+      data: {
+        status: "PUBLISHED",
+        submittedAt: now,
+        submittedById: adminId,
+        needsRenotify: false
+      }
+    }),
+    prisma.shift.updateMany({
+      where: { weeklyPlanId: plan.id },
+      data: { notifiedAt: now }
+    }),
+    prisma.notification.createMany({
+      data: assignedUserIds.map((userId) => ({
+        userId,
+        type: "WEEKLY_SHIFTS_PUBLISHED",
+        channel: "IN_APP",
+        status: "SENT",
+        title: "New weekly schedule published",
+        body: `Your shifts for the week ${weekLabel} have been published. Please review and respond.`,
+        sentAt: now,
+        payload: { weekPlanId: plan.id }
+      }))
+    })
+  ]);
+  return buildScheduleDetail(plan.id);
+};
+var unpublishSchedule = async (weekPlanId) => {
+  const plan = await getPlanOr404(weekPlanId);
+  if (plan.status !== "PUBLISHED") {
+    throw new AppError("Only a published schedule can be unpublished.", 409);
+  }
+  await prisma.weeklyPlan.update({
+    where: { id: plan.id },
+    data: { status: "DRAFT" }
+  });
+  return buildScheduleDetail(plan.id);
+};
+var addShift = async (weekPlanId, data) => {
+  const plan = await getPlanOr404(weekPlanId);
+  const [user, category, membership] = await Promise.all([
+    prisma.user.findUnique({
+      where: { id: data.userId },
+      select: { id: true, isActive: true }
+    }),
+    prisma.category.findUnique({
+      where: { id: data.categoryId },
+      select: { id: true, isActive: true }
+    }),
+    prisma.userCategory.findUnique({
+      where: { userId_categoryId: { userId: data.userId, categoryId: data.categoryId } },
+      select: { userId: true }
+    })
+  ]);
+  if (!user) throw new AppError("Employee not found.", 404);
+  if (!user.isActive) throw new AppError("Employee is deactivated.", 409);
+  if (!category) throw new AppError("Category not found.", 404);
+  if (!category.isActive) throw new AppError("Category is inactive.", 409);
+  if (!membership) {
+    throw new AppError("This employee is not assigned to that category.", 409);
+  }
+  const date = startOfUTCDay3(new Date(data.date));
+  if (date < startOfUTCDay3(plan.weekStartDate) || date > startOfUTCDay3(plan.weekEndDate)) {
+    throw new AppError("Shift date falls outside this plan's week.", 400);
+  }
+  const slot = { startTime: new Date(data.startTime), endTime: new Date(data.endTime) };
+  const rules = await loadRuleSettings();
+  const weekWindow2 = {
+    start: startOfUTCDay3(plan.weekStartDate),
+    endExclusive: addDays3(startOfUTCDay3(plan.weekEndDate), 1)
+  };
+  const existing = (await loadNearbyShifts([data.userId], plan)).get(data.userId) ?? [];
+  const violations = evaluateAssignment(slot, existing, rules, weekWindow2);
+  if (violations.some((v) => v.startsWith("OVERLAP"))) {
+    throw new AppError("This employee already has an overlapping shift.", 409);
+  }
+  const shift = await prisma.shift.create({
+    data: {
+      weeklyPlanId: plan.id,
+      userId: data.userId,
+      categoryId: data.categoryId,
+      date,
+      startTime: slot.startTime,
+      endTime: slot.endTime,
+      status: "PENDING",
+      rulePassed: violations.length === 0,
+      ...violations.length > 0 ? { ruleViolations: violations } : {}
+    },
+    select: shiftSelect2
+  });
+  let nextWeekDemandReduced = false;
+  let availabilityDayRemoved = false;
+  if (data.reduceNextWeekDemand) {
+    const nextWeekDate = addDays3(date, 7);
+    const nextDayDemand = await prisma.dayDemand.findFirst({
+      where: { categoryId: data.categoryId, date: nextWeekDate, requiredCount: { gt: 0 } },
+      select: { id: true, requiredCount: true, demandWeekId: true }
+    });
+    if (nextDayDemand) {
+      await prisma.dayDemand.update({
+        where: { id: nextDayDemand.id },
+        data: { requiredCount: nextDayDemand.requiredCount - 1 }
+      });
+      await prisma.staffingDemand.updateMany({
+        where: {
+          categoryId: data.categoryId,
+          date: nextWeekDate,
+          requiredCount: { gt: 0 },
+          weeklyPlan: { status: { not: "PUBLISHED" } }
+        },
+        data: { requiredCount: { decrement: 1 } }
+      });
+      nextWeekDemandReduced = true;
+    }
+    const removed = await prisma.availabilityDay.deleteMany({
+      where: { availabilityMonth: { userId: data.userId }, date }
+    });
+    availabilityDayRemoved = removed.count > 0;
+  }
+  if (plan.status === "PUBLISHED") {
+    await prisma.$transaction([
+      prisma.weeklyPlan.update({
+        where: { id: plan.id },
+        data: { needsRenotify: true }
+      }),
+      prisma.notification.create({
+        data: {
+          userId: data.userId,
+          type: "SHIFT_CHANGED",
+          channel: "IN_APP",
+          status: "SENT",
+          title: "Schedule updated",
+          body: `A new shift on ${dateOnly4(date)} was added to your published schedule. Please review it.`,
+          sentAt: /* @__PURE__ */ new Date(),
+          payload: { weekPlanId: plan.id, shiftId: shift.id }
+        }
+      })
+    ]);
+  }
+  return {
+    shift,
+    ruleViolations: violations,
+    rulePassed: violations.length === 0,
+    nextWeekDemandReduced,
+    availabilityDayRemoved
+  };
+};
+var getShiftInPlanOr404 = async (weekPlanId, shiftId) => {
+  const shift = await prisma.shift.findUnique({
+    where: { id: shiftId },
+    select: { id: true, weeklyPlanId: true, userId: true, date: true }
+  });
+  if (!shift || shift.weeklyPlanId !== weekPlanId) {
+    throw new AppError("Shift not found in this weekly plan.", 404);
+  }
+  return shift;
+};
+var updateShift3 = async (weekPlanId, shiftId, data) => {
+  const plan = await getPlanOr404(weekPlanId);
+  const shift = await getShiftInPlanOr404(plan.id, shiftId);
+  const slot = { startTime: new Date(data.startTime), endTime: new Date(data.endTime) };
+  const rules = await loadRuleSettings();
+  const weekWindow2 = {
+    start: startOfUTCDay3(plan.weekStartDate),
+    endExclusive: addDays3(startOfUTCDay3(plan.weekEndDate), 1)
+  };
+  const existing = (await loadNearbyShifts([shift.userId], plan, shiftId)).get(shift.userId) ?? [];
+  const violations = evaluateAssignment(slot, existing, rules, weekWindow2);
+  if (violations.some((v) => v.startsWith("OVERLAP"))) {
+    throw new AppError("The new time overlaps another shift for this employee.", 409);
+  }
+  const updated = await prisma.shift.update({
+    where: { id: shiftId },
+    data: {
+      startTime: slot.startTime,
+      endTime: slot.endTime,
+      date: startOfUTCDay3(slot.startTime),
+      rulePassed: violations.length === 0,
+      ruleViolations: violations.length > 0 ? violations : prismaNamespace_exports.JsonNull
+    },
+    select: shiftSelect2
+  });
+  if (plan.status === "PUBLISHED") {
+    await prisma.$transaction([
+      prisma.weeklyPlan.update({
+        where: { id: plan.id },
+        data: { needsRenotify: true }
+      }),
+      prisma.notification.create({
+        data: {
+          userId: shift.userId,
+          type: "SHIFT_CHANGED",
+          channel: "IN_APP",
+          status: "SENT",
+          title: "Schedule updated",
+          body: `Your shift on ${dateOnly4(shift.date)} was rescheduled. Please review the new time.`,
+          sentAt: /* @__PURE__ */ new Date(),
+          payload: { weekPlanId: plan.id, shiftId }
+        }
+      })
+    ]);
+  }
+  return { shift: updated, ruleViolations: violations, rulePassed: violations.length === 0 };
+};
+var removeShift = async (weekPlanId, shiftId) => {
+  const plan = await getPlanOr404(weekPlanId);
+  const shift = await getShiftInPlanOr404(plan.id, shiftId);
+  await prisma.shift.delete({ where: { id: shiftId } });
+  if (plan.status === "PUBLISHED") {
+    await prisma.$transaction([
+      prisma.weeklyPlan.update({
+        where: { id: plan.id },
+        data: { needsRenotify: true }
+      }),
+      prisma.notification.create({
+        data: {
+          userId: shift.userId,
+          type: "SHIFT_CHANGED",
+          channel: "IN_APP",
+          status: "SENT",
+          title: "Schedule updated",
+          body: `Your shift on ${dateOnly4(shift.date)} was removed from the schedule.`,
+          sentAt: /* @__PURE__ */ new Date(),
+          payload: { weekPlanId: plan.id }
+        }
+      })
+    ]);
+  }
+};
+var getAvailabilityForPlan = async (weekPlanId) => {
+  const plan = await getPlanOr404(weekPlanId);
+  const weekStart = startOfUTCDay3(plan.weekStartDate);
+  const weekEndExclusive = addDays3(startOfUTCDay3(plan.weekEndDate), 1);
+  const users = await prisma.user.findMany({
+    where: { isActive: true },
+    select: {
+      id: true,
+      name: true,
+      firstName: true,
+      lastName: true,
+      email: true,
+      categories: { select: { category: { select: { name: true } } } },
+      availabilityMonths: {
+        where: {
+          year: plan.year,
+          month: plan.month
+        },
+        select: {
+          id: true,
+          year: true,
+          month: true,
+          days: {
+            where: {
+              date: { gte: weekStart, lt: weekEndExclusive },
+              status: { in: ["AVAILABLE", "WISH"] }
+            }
+          }
+        }
+      }
+    }
+  });
+  const pad = (n) => String(n).padStart(2, "0");
+  const hhmm = (d) => `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+  return users.filter((u) => u.availabilityMonths.length > 0 && (u.availabilityMonths[0]?.days.length ?? 0) > 0).map((u) => {
+    const defaultCategory = u.categories[0]?.category?.name || "Unassigned";
+    const monthRecord = u.availabilityMonths[0];
+    const monthStr = `${monthRecord.year}-${pad(monthRecord.month)}`;
+    return {
+      user: {
+        name: displayName3(u),
+        email: u.email
+      },
+      slots: {
+        date: monthStr,
+        avalibltyslots: monthRecord.days.map((d) => ({
+          date: dateOnly4(d.date),
+          "time-slot": d.preferredStartTime && d.preferredEndTime ? `${hhmm(d.preferredStartTime)} to ${hhmm(d.preferredEndTime)}` : "Any time",
+          category: defaultCategory
+        }))
+      }
+    };
+  });
+};
+var schedulingServices = {
+  listPlans,
+  listMonths,
+  getSchedule: buildScheduleDetail,
+  generateSchedule,
+  generateMonthSchedule,
+  publishSchedule,
+  unpublishSchedule,
+  addShift,
+  updateShift: updateShift3,
+  removeShift,
+  getAvailabilityForPlan
+};
+
+// src/modules/admin/scheduling/scheduling.controller.ts
+var listPlans2 = async (req, res) => {
+  const query = req.validated;
+  const result = await schedulingServices.listPlans(query);
+  sendSuccess(res, {
+    statusCode: 200,
+    message: "Weekly plans fetched successfully.",
+    data: { plans: result.plans },
+    meta: { pagination: result.pagination }
+  });
+};
+var listMonths2 = async (_req, res) => {
+  const result = await schedulingServices.listMonths();
+  sendSuccess(res, {
+    statusCode: 200,
+    message: "Monthly schedules fetched successfully.",
+    data: result
+  });
+};
+var generateMonthSchedule2 = async (req, res) => {
+  const data = req.validated;
+  const result = await schedulingServices.generateMonthSchedule(data);
+  sendSuccess(res, {
+    statusCode: 201,
+    message: `Schedule generated for ${result.generatedCount} week(s).`,
+    data: result
+  });
+};
+var getSchedule = async (req, res) => {
+  const weekPlanId = req.params.weekPlanId;
+  const result = await schedulingServices.getSchedule(weekPlanId);
+  sendSuccess(res, {
+    statusCode: 200,
+    message: "Schedule fetched successfully.",
+    data: result
+  });
+};
+var generateSchedule2 = async (req, res) => {
+  const data = req.validated;
+  const result = await schedulingServices.generateSchedule(data);
+  sendSuccess(res, {
+    statusCode: 201,
+    message: "Schedule generated successfully.",
+    data: result
+  });
+};
+var publishSchedule2 = async (req, res) => {
+  const weekPlanId = req.params.weekPlanId;
+  const adminId = res.locals.auth.userId;
+  const result = await schedulingServices.publishSchedule(weekPlanId, adminId);
+  sendSuccess(res, {
+    statusCode: 200,
+    message: "Schedule published successfully. Assigned employees have been notified.",
+    data: result
+  });
+};
+var unpublishSchedule2 = async (req, res) => {
+  const weekPlanId = req.params.weekPlanId;
+  const result = await schedulingServices.unpublishSchedule(weekPlanId);
+  sendSuccess(res, {
+    statusCode: 200,
+    message: "Schedule unpublished. It is now a draft again.",
+    data: result
+  });
+};
+var addShift2 = async (req, res) => {
+  const weekPlanId = req.params.weekPlanId;
+  const data = req.validated;
+  const result = await schedulingServices.addShift(weekPlanId, data);
+  sendSuccess(res, {
+    statusCode: 201,
+    message: result.rulePassed ? "Shift added successfully." : "Shift added with rule violations \u2014 review the violations panel.",
+    data: result
+  });
+};
+var updateShift4 = async (req, res) => {
+  const weekPlanId = req.params.weekPlanId;
+  const shiftId = req.params.shiftId;
+  const data = req.validated;
+  const result = await schedulingServices.updateShift(weekPlanId, shiftId, data);
+  sendSuccess(res, {
+    statusCode: 200,
+    message: result.rulePassed ? "Shift updated successfully." : "Shift updated with rule violations \u2014 review the violations panel.",
+    data: result
+  });
+};
+var removeShift2 = async (req, res) => {
+  const weekPlanId = req.params.weekPlanId;
+  const shiftId = req.params.shiftId;
+  await schedulingServices.removeShift(weekPlanId, shiftId);
+  sendSuccess(res, {
+    statusCode: 200,
+    message: "Shift removed successfully."
+  });
+};
+var getAvailability = async (req, res) => {
+  const weekPlanId = req.params.weekPlanId;
+  const result = await schedulingServices.getAvailabilityForPlan(weekPlanId);
+  sendSuccess(res, {
+    statusCode: 200,
+    message: "Availability fetched successfully.",
+    data: result
+  });
+};
+
+// src/modules/admin/scheduling/scheduling.route.ts
+var schedulingRouter = Router12();
+schedulingRouter.use(authenticate, authorizeAdmin);
+schedulingRouter.get(
+  "/",
+  validateRequest(listPlansQuerySchema),
+  asyncHandler(listPlans2)
+);
+schedulingRouter.get("/months", asyncHandler(listMonths2));
+schedulingRouter.post(
+  "/generate",
+  validateRequest(generateScheduleSchema),
+  asyncHandler(generateSchedule2)
+);
+schedulingRouter.post(
+  "/generate-month",
+  validateRequest(generateMonthSchema),
+  asyncHandler(generateMonthSchedule2)
+);
+schedulingRouter.get("/:weekPlanId", asyncHandler(getSchedule));
+schedulingRouter.get("/:weekPlanId/availability", asyncHandler(getAvailability));
+schedulingRouter.post(
+  "/:weekPlanId/publish",
+  asyncHandler(publishSchedule2)
+);
+schedulingRouter.post(
+  "/:weekPlanId/unpublish",
+  asyncHandler(unpublishSchedule2)
+);
+schedulingRouter.post(
+  "/:weekPlanId/shifts",
+  validateRequest(createShiftSchema2),
+  asyncHandler(addShift2)
+);
+schedulingRouter.patch(
+  "/:weekPlanId/shifts/:shiftId",
+  validateRequest(updateShiftSchema2),
+  asyncHandler(updateShift4)
+);
+schedulingRouter.delete(
+  "/:weekPlanId/shifts/:shiftId",
+  asyncHandler(removeShift2)
+);
+var scheduling_route_default = schedulingRouter;
+
+// src/modules/admin/attendance/attendance.route.ts
+import { Router as Router13 } from "express";
+
+// src/modules/admin/attendance/attendance.validation.ts
+import { z as z13 } from "zod";
+var dateString4 = (label) => z13.string().trim().min(1, `${label} is required`).refine((s) => !Number.isNaN(Date.parse(s)), {
+  message: `${label} must be a valid date`
+});
+var listAttendanceQuerySchema = z13.object({
+  page: z13.coerce.number().int().min(1).default(1),
+  limit: z13.coerce.number().int().min(1).max(100).default(20),
+  userId: z13.string().min(1).optional(),
+  date: dateString4("Date").optional(),
+  status: z13.enum(["ACTIVE", "ON_BREAK", "COMPLETED"]).optional()
+});
+var reportQuerySchema2 = z13.object({
+  from: dateString4("From date").optional(),
+  to: dateString4("To date").optional(),
+  month: z13.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/, "month must be in YYYY-MM format").optional(),
+  userId: z13.string().min(1).optional()
+}).refine((q) => !(q.from && !q.to) && !(q.to && !q.from), {
+  message: "Provide both from and to, or neither",
+  path: ["to"]
+});
+
+// src/modules/admin/attendance/attendance.service.ts
+var startOfUTCDay4 = (d) => new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+var addDays4 = (d, n) => {
+  const x = new Date(d);
+  x.setUTCDate(x.getUTCDate() + n);
+  return x;
+};
+var userSelect2 = {
+  id: true,
+  name: true,
+  firstName: true,
+  lastName: true,
+  email: true,
+  hourlyRate: true
+};
+var entrySelect = {
+  id: true,
+  userId: true,
+  user: { select: userSelect2 },
+  shiftId: true,
+  shift: {
+    select: {
+      id: true,
+      date: true,
+      startTime: true,
+      endTime: true,
+      category: { select: { id: true, name: true } }
+    }
+  },
+  clockInAt: true,
+  clockOutAt: true,
+  breakMinutes: true,
+  status: true,
+  workedMinutes: true,
+  lateMinutes: true,
+  overtimeMinutes: true,
+  location: true,
+  note: true
+};
+var listAttendance = async (query) => {
+  const { page, limit, userId, date, status } = query;
+  const skip = (page - 1) * limit;
+  const where = {};
+  if (userId) where.userId = userId;
+  if (status) where.status = status;
+  if (date) {
+    const day = startOfUTCDay4(new Date(date));
+    where.clockInAt = { gte: day, lt: addDays4(day, 1) };
+  }
+  const [entries, total] = await Promise.all([
+    prisma.timeEntry.findMany({
+      where,
+      skip,
+      take: limit,
+      orderBy: { clockInAt: "desc" },
+      select: entrySelect
+    }),
+    prisma.timeEntry.count({ where })
+  ]);
+  return {
+    entries,
+    pagination: { page, limit, total, totalPages: Math.ceil(total / limit) }
+  };
+};
+var getAttendanceReport = async (query) => {
+  let start;
+  let endExclusive;
+  if (query.from && query.to) {
+    start = startOfUTCDay4(new Date(query.from));
+    endExclusive = addDays4(startOfUTCDay4(new Date(query.to)), 1);
+  } else {
+    const anchor = query.month ? /* @__PURE__ */ new Date(`${query.month}-01T00:00:00.000Z`) : /* @__PURE__ */ new Date();
+    start = new Date(Date.UTC(anchor.getUTCFullYear(), anchor.getUTCMonth(), 1));
+    endExclusive = new Date(Date.UTC(anchor.getUTCFullYear(), anchor.getUTCMonth() + 1, 1));
+  }
+  const entryWhere = {
+    status: "COMPLETED",
+    clockInAt: { gte: start, lt: endExclusive }
+  };
+  if (query.userId) entryWhere.userId = query.userId;
+  const now = /* @__PURE__ */ new Date();
+  const [entries, endedShifts] = await Promise.all([
+    prisma.timeEntry.findMany({
+      where: entryWhere,
+      select: {
+        userId: true,
+        user: { select: userSelect2 },
+        workedMinutes: true,
+        breakMinutes: true,
+        lateMinutes: true,
+        overtimeMinutes: true
+      }
+    }),
+    // Absence detection: published roster shifts that have ended with no time
+    // entry recorded against them (computed on read, never persisted).
+    prisma.shift.findMany({
+      where: {
+        date: { gte: start, lt: endExclusive },
+        endTime: { lt: now },
+        status: { in: ["ACCEPTED", "PENDING"] },
+        weeklyPlan: { status: "PUBLISHED" },
+        timeEntries: { none: {} },
+        ...query.userId ? { userId: query.userId } : {}
+      },
+      select: {
+        id: true,
+        userId: true,
+        user: { select: userSelect2 },
+        date: true,
+        startTime: true,
+        endTime: true,
+        category: { select: { id: true, name: true } }
+      },
+      orderBy: [{ date: "asc" }, { startTime: "asc" }]
+    })
+  ]);
+  const byUser = /* @__PURE__ */ new Map();
+  const rowFor = (userId, user) => {
+    let row = byUser.get(userId);
+    if (!row) {
+      row = {
+        user,
+        workedMinutes: 0,
+        breakMinutes: 0,
+        lateCount: 0,
+        overtimeMinutes: 0,
+        entryCount: 0,
+        absenceCount: 0
+      };
+      byUser.set(userId, row);
+    }
+    return row;
+  };
+  for (const e of entries) {
+    const row = rowFor(e.userId, e.user);
+    row.workedMinutes += e.workedMinutes ?? 0;
+    row.breakMinutes += e.breakMinutes;
+    row.lateCount += (e.lateMinutes ?? 0) > 0 ? 1 : 0;
+    row.overtimeMinutes += e.overtimeMinutes ?? 0;
+    row.entryCount += 1;
+  }
+  for (const s of endedShifts) {
+    rowFor(s.userId, s.user).absenceCount += 1;
+  }
+  const employees = [...byUser.entries()].map(([userId, row]) => {
+    const workedHours = row.workedMinutes / 60;
+    const hourlyRate = row.user.hourlyRate ? Number(row.user.hourlyRate) : null;
+    return {
+      userId,
+      user: row.user,
+      workedHours: Number(workedHours.toFixed(2)),
+      breakMinutes: row.breakMinutes,
+      lateCount: row.lateCount,
+      overtimeMinutes: row.overtimeMinutes,
+      entryCount: row.entryCount,
+      absenceCount: row.absenceCount,
+      estimatedWage: hourlyRate !== null ? Number((workedHours * hourlyRate).toFixed(2)) : null
+    };
+  });
+  return {
+    range: {
+      start: start.toISOString().slice(0, 10),
+      end: addDays4(endExclusive, -1).toISOString().slice(0, 10)
+    },
+    employees,
+    absences: endedShifts.map((s) => ({
+      shiftId: s.id,
+      userId: s.userId,
+      userName: s.user.name ?? ([s.user.firstName, s.user.lastName].filter(Boolean).join(" ") || s.user.email),
+      date: s.date,
+      startTime: s.startTime,
+      endTime: s.endTime,
+      category: s.category
+    })),
+    totals: {
+      workedHours: Number(employees.reduce((sum, e) => sum + e.workedHours, 0).toFixed(2)),
+      estimatedWage: Number(
+        employees.reduce((sum, e) => sum + (e.estimatedWage ?? 0), 0).toFixed(2)
+      ),
+      absenceCount: endedShifts.length
+    }
+  };
+};
+var adminAttendanceServices = {
+  listAttendance,
+  getAttendanceReport
+};
+
+// src/modules/admin/attendance/attendance.controller.ts
+var listAttendance2 = async (req, res) => {
+  const query = req.validated;
+  const result = await adminAttendanceServices.listAttendance(query);
+  sendSuccess(res, {
+    statusCode: 200,
+    message: "Attendance entries fetched successfully.",
+    data: { entries: result.entries },
+    meta: { pagination: result.pagination }
+  });
+};
+var getAttendanceReport2 = async (req, res) => {
+  const query = req.validated;
+  const result = await adminAttendanceServices.getAttendanceReport(query);
+  sendSuccess(res, {
+    statusCode: 200,
+    message: "Attendance report generated successfully.",
+    data: result
+  });
+};
+
+// src/modules/admin/attendance/attendance.route.ts
+var adminAttendanceRouter = Router13();
+adminAttendanceRouter.use(authenticate, authorizeAdmin);
+adminAttendanceRouter.get(
+  "/",
+  validateRequest(listAttendanceQuerySchema),
+  asyncHandler(listAttendance2)
+);
+adminAttendanceRouter.get(
+  "/report",
+  validateRequest(reportQuerySchema2),
+  asyncHandler(getAttendanceReport2)
+);
+var attendance_route_default = adminAttendanceRouter;
+
+// src/modules/admin/leaves/leaves.route.ts
+import { Router as Router14 } from "express";
+
+// src/modules/admin/leaves/leaves.validation.ts
+import { z as z14 } from "zod";
+var listLeavesQuerySchema = z14.object({
+  page: z14.coerce.number().int().min(1).default(1),
+  limit: z14.coerce.number().int().min(1).max(100).default(20),
+  status: z14.enum(["PENDING", "APPROVED", "REJECTED", "CANCELLED"]).optional(),
+  userId: z14.string().min(1).optional()
+});
+var reviewLeaveSchema = z14.object({
+  adminNote: z14.string().trim().max(2e3).optional()
+});
+
+// src/modules/admin/leaves/leaves.service.ts
+var addDays5 = (d, n) => {
+  const x = new Date(d);
+  x.setUTCDate(x.getUTCDate() + n);
+  return x;
+};
+var adminLeaveSelect = {
+  id: true,
+  userId: true,
+  user: {
+    select: { id: true, name: true, firstName: true, lastName: true, email: true }
+  },
+  leaveType: true,
+  startDate: true,
+  endDate: true,
+  reason: true,
+  status: true,
+  adminNote: true,
+  reviewedById: true,
+  reviewedAt: true,
+  createdAt: true,
+  updatedAt: true
+};
+var listLeaves = async (query) => {
+  const { page, limit, status, userId } = query;
+  const skip = (page - 1) * limit;
+  const where = {};
+  if (status) where.status = status;
+  if (userId) where.userId = userId;
+  const [leaves, total] = await Promise.all([
+    prisma.leaveRequest.findMany({
+      where,
+      skip,
+      take: limit,
+      orderBy: { createdAt: "desc" },
+      select: adminLeaveSelect
+    }),
+    prisma.leaveRequest.count({ where })
+  ]);
+  const withImpact = await Promise.all(
+    leaves.map(async (leave) => {
+      if (leave.status !== "PENDING") return { ...leave, affectedShiftCount: 0 };
+      const affectedShiftCount = await prisma.shift.count({
+        where: {
+          userId: leave.userId,
+          date: { gte: leave.startDate, lt: addDays5(leave.endDate, 1) },
+          status: { notIn: ["CANCELLED", "REJECTED"] }
+        }
+      });
+      return { ...leave, affectedShiftCount };
+    })
+  );
+  return {
+    leaves: withImpact,
+    pagination: { page, limit, total, totalPages: Math.ceil(total / limit) }
+  };
+};
+var getPendingLeaveOr404 = async (leaveId) => {
+  const leave = await prisma.leaveRequest.findUnique({
+    where: { id: leaveId },
+    select: {
+      id: true,
+      userId: true,
+      status: true,
+      startDate: true,
+      endDate: true,
+      leaveType: true
+    }
+  });
+  if (!leave) throw new AppError("Leave request not found.", 404);
+  if (leave.status !== "PENDING") {
+    throw new AppError("Only a pending leave request can be reviewed.", 409);
+  }
+  return leave;
+};
+var approveLeave = async (leaveId, adminId, data) => {
+  const leave = await getPendingLeaveOr404(leaveId);
+  const now = /* @__PURE__ */ new Date();
+  const [updated, cancelled] = await prisma.$transaction([
+    prisma.leaveRequest.update({
+      where: { id: leaveId },
+      data: {
+        status: "APPROVED",
+        reviewedById: adminId,
+        reviewedAt: now,
+        ...data.adminNote !== void 0 ? { adminNote: data.adminNote } : {}
+      },
+      select: adminLeaveSelect
+    }),
+    prisma.shift.updateMany({
+      where: {
+        userId: leave.userId,
+        date: { gte: leave.startDate, lt: addDays5(leave.endDate, 1) },
+        status: { notIn: ["CANCELLED", "REJECTED"] }
+      },
+      data: {
+        status: "CANCELLED",
+        rejectionReason: "Employee on approved leave",
+        leaveRequestId: leaveId
+      }
+    }),
+    prisma.notification.create({
+      data: {
+        userId: leave.userId,
+        type: "LEAVE_REQUEST_RESULT",
+        channel: "IN_APP",
+        status: "SENT",
+        title: "Leave approved",
+        body: `Your ${leave.leaveType.toLowerCase()} leave from ${leave.startDate.toISOString().slice(0, 10)} to ${leave.endDate.toISOString().slice(0, 10)} has been approved.`,
+        sentAt: now,
+        payload: { leaveId }
+      }
+    })
+  ]);
+  return { leave: updated, cancelledShiftCount: cancelled.count };
+};
+var rejectLeave = async (leaveId, adminId, data) => {
+  const leave = await getPendingLeaveOr404(leaveId);
+  const now = /* @__PURE__ */ new Date();
+  const [updated] = await prisma.$transaction([
+    prisma.leaveRequest.update({
+      where: { id: leaveId },
+      data: {
+        status: "REJECTED",
+        reviewedById: adminId,
+        reviewedAt: now,
+        ...data.adminNote !== void 0 ? { adminNote: data.adminNote } : {}
+      },
+      select: adminLeaveSelect
+    }),
+    prisma.notification.create({
+      data: {
+        userId: leave.userId,
+        type: "LEAVE_REQUEST_RESULT",
+        channel: "IN_APP",
+        status: "SENT",
+        title: "Leave rejected",
+        body: `Your ${leave.leaveType.toLowerCase()} leave request was not approved.${data.adminNote ? ` Note: ${data.adminNote}` : ""}`,
+        sentAt: now,
+        payload: { leaveId }
+      }
+    })
+  ]);
+  return { leave: updated };
+};
+var adminLeavesServices = {
+  listLeaves,
+  approveLeave,
+  rejectLeave
+};
+
+// src/modules/admin/leaves/leaves.controller.ts
+var authAdminId = (res) => res.locals.auth.userId;
+var listLeaves2 = async (req, res) => {
+  const query = req.validated;
+  const result = await adminLeavesServices.listLeaves(query);
+  sendSuccess(res, {
+    statusCode: 200,
+    message: "Leave requests fetched successfully.",
+    data: { leaves: result.leaves },
+    meta: { pagination: result.pagination }
+  });
+};
+var approveLeave2 = async (req, res) => {
+  const leaveId = req.params.leaveId;
+  const data = req.validated;
+  const result = await adminLeavesServices.approveLeave(leaveId, authAdminId(res), data);
+  sendSuccess(res, {
+    statusCode: 200,
+    message: result.cancelledShiftCount > 0 ? `Leave approved. ${result.cancelledShiftCount} scheduled shift(s) were cancelled.` : "Leave approved.",
+    data: result
+  });
+};
+var rejectLeave2 = async (req, res) => {
+  const leaveId = req.params.leaveId;
+  const data = req.validated;
+  const result = await adminLeavesServices.rejectLeave(leaveId, authAdminId(res), data);
+  sendSuccess(res, {
+    statusCode: 200,
+    message: "Leave rejected.",
+    data: result
+  });
+};
+
+// src/modules/admin/leaves/leaves.route.ts
+var adminLeavesRouter = Router14();
+adminLeavesRouter.use(authenticate, authorizeAdmin);
+adminLeavesRouter.get(
+  "/",
+  validateRequest(listLeavesQuerySchema),
+  asyncHandler(listLeaves2)
+);
+adminLeavesRouter.post(
+  "/:leaveId/approve",
+  validateRequest(reviewLeaveSchema),
+  asyncHandler(approveLeave2)
+);
+adminLeavesRouter.post(
+  "/:leaveId/reject",
+  validateRequest(reviewLeaveSchema),
+  asyncHandler(rejectLeave2)
+);
+var leaves_route_default = adminLeavesRouter;
+
+// src/modules/admin/schedule-swaps/schedule-swaps.route.ts
+import { Router as Router15 } from "express";
+
+// src/modules/admin/schedule-swaps/schedule-swaps.validation.ts
+import { z as z15 } from "zod";
+var listScheduleSwapsQuerySchema = z15.object({
+  page: z15.coerce.number().int().min(1).default(1),
+  limit: z15.coerce.number().int().min(1).max(100).default(20),
+  status: z15.enum([
+    "PENDING_RECIPIENT",
+    "PENDING_ADMIN_APPROVAL",
+    "APPROVED",
+    "REJECTED",
+    "EXPIRED",
+    "CANCELLED"
+  ]).optional()
+});
+var reviewScheduleSwapSchema = z15.object({
+  reason: z15.string().trim().max(2e3).optional()
+});
+
+// src/modules/user/schedule-swaps/schedule-swaps.service.ts
+var HOURS_PER_MS4 = 1 / (1e3 * 60 * 60);
+var startOfUTCDay5 = (d) => new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+var addDays6 = (d, n) => {
+  const x = new Date(d);
+  x.setUTCDate(x.getUTCDate() + n);
+  return x;
+};
+var durationHours3 = (s) => (s.endTime.getTime() - s.startTime.getTime()) * HOURS_PER_MS4;
+var displayName4 = (u) => u.name ?? ([u.firstName, u.lastName].filter(Boolean).join(" ") || u.email);
+var swapShiftSelect = {
+  id: true,
+  date: true,
+  startTime: true,
+  endTime: true,
+  status: true,
+  category: { select: { id: true, name: true } }
+};
+var swapUserSelect = {
+  id: true,
+  name: true,
+  firstName: true,
+  lastName: true,
+  email: true
+};
+var scheduleSwapSelect = {
+  id: true,
+  swapType: true,
+  initiatorUserId: true,
+  initiatorUser: { select: swapUserSelect },
+  initiatorShiftId: true,
+  initiatorShift: { select: swapShiftSelect },
+  recipientUserId: true,
+  recipientUser: { select: swapUserSelect },
+  recipientShiftId: true,
+  recipientShift: { select: swapShiftSelect },
+  status: true,
+  recipientRespondedAt: true,
+  ruleCheckResult: true,
+  ruleCheckPassed: true,
+  adminReason: true,
+  resolvedAt: true,
+  expiresAt: true,
+  createdAt: true,
+  updatedAt: true
+};
+var OPEN_SWAP_STATUSES = ["PENDING_RECIPIENT", "PENDING_ADMIN_APPROVAL"];
+var projectedHours2 = async (userId, window, excludeShiftId, incomingShift) => {
+  const rows = await prisma.shift.findMany({
+    where: {
+      userId,
+      id: { not: excludeShiftId },
+      startTime: { gte: window.start, lt: window.endExclusive },
+      status: { notIn: ["CANCELLED", "REJECTED", "SWAPPED_OUT"] }
+    },
+    select: { startTime: true, endTime: true }
+  });
+  let hours = rows.reduce((sum, r) => sum + durationHours3(r), 0);
+  if (incomingShift.startTime >= window.start && incomingShift.startTime < window.endExclusive) {
+    hours += durationHours3(incomingShift);
+  }
+  return hours;
+};
+var weekWindow = (d) => {
+  const day = startOfUTCDay5(d);
+  const diffToMonday = (day.getUTCDay() + 6) % 7;
+  const start = addDays6(day, -diffToMonday);
+  return { start, endExclusive: addDays6(start, 7) };
+};
+var dayWindow = (d) => {
+  const start = startOfUTCDay5(d);
+  return { start, endExclusive: addDays6(start, 1) };
+};
+var evaluateSwapRules2 = async (parties) => {
+  const settings = await prisma.orgSettings.findUnique({
+    where: { id: 1 },
+    select: { maxDailyHours: true, maxWeeklyHours: true }
+  });
+  const maxWeekly = settings ? Number(settings.maxWeeklyHours) : Infinity;
+  const maxDaily = settings ? Number(settings.maxDailyHours) : Infinity;
+  const violations = [];
+  for (const p of parties) {
+    const week = await projectedHours2(
+      p.userId,
+      weekWindow(p.takingShift.startTime),
+      p.givingShiftId,
+      p.takingShift
+    );
+    if (week > maxWeekly) {
+      violations.push(`Would exceed ${maxWeekly}h weekly max for ${p.name}`);
+    }
+    const day = await projectedHours2(
+      p.userId,
+      dayWindow(p.takingShift.startTime),
+      p.givingShiftId,
+      p.takingShift
+    );
+    if (day > maxDaily) {
+      violations.push(`Would exceed ${maxDaily}h daily max for ${p.name}`);
+    }
+  }
+  return { passed: violations.length === 0, violations };
+};
+var searchSwapTargets = async (userId, query) => {
+  const day = startOfUTCDay5(new Date(query.date));
+  const shifts = await prisma.shift.findMany({
+    where: {
+      date: day,
+      userId: { not: userId },
+      status: { in: ["PENDING", "ACCEPTED"] },
+      endTime: { gt: /* @__PURE__ */ new Date() },
+      weeklyPlan: { status: "PUBLISHED" },
+      ...query.categoryId ? { categoryId: query.categoryId } : {},
+      // Exclude shifts already tied up in an open swap.
+      swapsAsInitiatorShift: { none: { status: { in: [...OPEN_SWAP_STATUSES] } } },
+      swapsAsRecipientShift: { none: { status: { in: [...OPEN_SWAP_STATUSES] } } }
+    },
+    orderBy: [{ startTime: "asc" }],
+    select: {
+      ...swapShiftSelect,
+      userId: true,
+      user: { select: swapUserSelect }
+    }
+  });
+  return { date: day.toISOString().slice(0, 10), shifts };
+};
+var createSwap2 = async (userId, data) => {
+  if (data.recipientUserId === userId) {
+    throw new AppError("You cannot request a swap with yourself.", 400);
+  }
+  const [initiatorShift, recipientShift] = await Promise.all([
+    prisma.shift.findUnique({
+      where: { id: data.initiatorShiftId },
+      select: {
+        id: true,
+        userId: true,
+        status: true,
+        startTime: true,
+        endTime: true,
+        weeklyPlan: { select: { status: true } },
+        user: { select: swapUserSelect }
+      }
+    }),
+    prisma.shift.findUnique({
+      where: { id: data.recipientShiftId },
+      select: {
+        id: true,
+        userId: true,
+        status: true,
+        startTime: true,
+        endTime: true,
+        weeklyPlan: { select: { status: true } },
+        user: { select: swapUserSelect }
+      }
+    })
+  ]);
+  if (!initiatorShift || initiatorShift.userId !== userId) {
+    throw new AppError("Your shift was not found.", 404);
+  }
+  if (!recipientShift || recipientShift.userId !== data.recipientUserId) {
+    throw new AppError("The other employee's shift was not found.", 404);
+  }
+  for (const [label, shift] of [
+    ["your shift", initiatorShift],
+    ["the other shift", recipientShift]
+  ]) {
+    if (shift.weeklyPlan.status !== "PUBLISHED") {
+      throw new AppError(`The schedule for ${label} is not published.`, 409);
+    }
+    if (shift.status !== "PENDING" && shift.status !== "ACCEPTED") {
+      throw new AppError(`Cannot swap: ${label} is ${shift.status.toLowerCase()}.`, 409);
+    }
+    if (shift.endTime <= /* @__PURE__ */ new Date()) {
+      throw new AppError(`Cannot swap: ${label} has already ended.`, 409);
+    }
+  }
+  const openSwap = await prisma.swapRequest.findFirst({
+    where: {
+      status: { in: [...OPEN_SWAP_STATUSES] },
+      OR: [
+        { initiatorShiftId: { in: [initiatorShift.id, recipientShift.id] } },
+        { recipientShiftId: { in: [initiatorShift.id, recipientShift.id] } }
+      ]
+    },
+    select: { id: true }
+  });
+  if (openSwap) {
+    throw new AppError("One of these shifts is already part of a pending swap request.", 409);
+  }
+  const ruleCheck = await evaluateSwapRules2([
+    {
+      userId,
+      name: displayName4(initiatorShift.user),
+      givingShiftId: initiatorShift.id,
+      takingShift: recipientShift
+    },
+    {
+      userId: data.recipientUserId,
+      name: displayName4(recipientShift.user),
+      givingShiftId: recipientShift.id,
+      takingShift: initiatorShift
+    }
+  ]);
+  const settings = await prisma.orgSettings.findUnique({
+    where: { id: 1 },
+    select: { swapExpiryHours: true }
+  });
+  const expiryHours = settings?.swapExpiryHours ?? 72;
+  const now = /* @__PURE__ */ new Date();
+  const [swap] = await prisma.$transaction([
+    prisma.swapRequest.create({
+      data: {
+        swapType: "TARGETED",
+        initiatorUserId: userId,
+        initiatorShiftId: initiatorShift.id,
+        recipientUserId: data.recipientUserId,
+        recipientShiftId: recipientShift.id,
+        status: "PENDING_RECIPIENT",
+        ruleCheckResult: ruleCheck,
+        ruleCheckPassed: ruleCheck.passed,
+        ruleCheckedAt: now,
+        expiresAt: new Date(now.getTime() + expiryHours * 60 * 60 * 1e3)
+      },
+      select: scheduleSwapSelect
+    }),
+    prisma.notification.create({
+      data: {
+        userId: data.recipientUserId,
+        type: "SWAP_REQUEST_RECEIVED",
+        channel: "IN_APP",
+        status: "SENT",
+        title: "Shift swap request",
+        body: `${displayName4(initiatorShift.user)} wants to swap shifts with you. Open the Swaps tab to respond.`,
+        sentAt: now,
+        payload: { kind: "scheduleSwap" }
+      }
+    })
+  ]);
+  return swap;
+};
+var listMySwaps2 = async (userId, query) => {
+  const { role, status, page, limit } = query;
+  const skip = (page - 1) * limit;
+  const where = role === "initiated" ? { initiatorUserId: userId } : role === "received" ? { recipientUserId: userId } : { OR: [{ initiatorUserId: userId }, { recipientUserId: userId }] };
+  if (status) where.status = status;
+  const [swaps, total] = await Promise.all([
+    prisma.swapRequest.findMany({
+      where,
+      skip,
+      take: limit,
+      orderBy: { createdAt: "desc" },
+      select: scheduleSwapSelect
+    }),
+    prisma.swapRequest.count({ where })
+  ]);
+  return {
+    swaps,
+    pagination: { page, limit, total, totalPages: Math.ceil(total / limit) }
+  };
+};
+var respondToSwap = async (userId, swapId, data) => {
+  const swap = await prisma.swapRequest.findUnique({
+    where: { id: swapId },
+    select: {
+      id: true,
+      status: true,
+      initiatorUserId: true,
+      recipientUserId: true,
+      expiresAt: true,
+      recipientUser: { select: swapUserSelect }
+    }
+  });
+  if (!swap || swap.recipientUserId !== userId) {
+    throw new AppError("Swap request not found.", 404);
+  }
+  if (swap.status !== "PENDING_RECIPIENT") {
+    throw new AppError("This swap request is no longer awaiting your response.", 409);
+  }
+  if (swap.expiresAt && swap.expiresAt <= /* @__PURE__ */ new Date()) {
+    await prisma.swapRequest.update({ where: { id: swapId }, data: { status: "EXPIRED" } });
+    throw new AppError("This swap request has expired.", 409);
+  }
+  const now = /* @__PURE__ */ new Date();
+  const accepted = data.action === "ACCEPT";
+  const recipientName = swap.recipientUser ? displayName4(swap.recipientUser) : "The other employee";
+  const [updated] = await prisma.$transaction([
+    prisma.swapRequest.update({
+      where: { id: swapId },
+      data: {
+        status: accepted ? "PENDING_ADMIN_APPROVAL" : "REJECTED",
+        recipientRespondedAt: now,
+        ...accepted ? {} : { resolvedAt: now }
+      },
+      select: scheduleSwapSelect
+    }),
+    prisma.notification.create({
+      data: {
+        userId: swap.initiatorUserId,
+        type: accepted ? "SWAP_PENDING_ADMIN_APPROVAL" : "SWAP_REQUEST_RESULT",
+        channel: "IN_APP",
+        status: "SENT",
+        title: accepted ? "Swap accepted \u2014 awaiting admin" : "Swap declined",
+        body: accepted ? `${recipientName} accepted your swap request. It now needs admin approval.` : `${recipientName} declined your swap request.`,
+        sentAt: now,
+        payload: { swapId, kind: "scheduleSwap" }
+      }
+    })
+  ]);
+  return updated;
+};
+var cancelSwap2 = async (userId, swapId) => {
+  const swap = await prisma.swapRequest.findUnique({
+    where: { id: swapId },
+    select: { id: true, status: true, initiatorUserId: true }
+  });
+  if (!swap || swap.initiatorUserId !== userId) {
+    throw new AppError("Swap request not found.", 404);
+  }
+  if (swap.status !== "PENDING_RECIPIENT") {
+    throw new AppError("Only a swap still awaiting the other employee can be cancelled.", 409);
+  }
+  return prisma.swapRequest.update({
+    where: { id: swapId },
+    data: { status: "CANCELLED", resolvedAt: /* @__PURE__ */ new Date() },
+    select: scheduleSwapSelect
+  });
+};
+var scheduleSwapsServices = {
+  searchSwapTargets,
+  createSwap: createSwap2,
+  listMySwaps: listMySwaps2,
+  respondToSwap,
+  cancelSwap: cancelSwap2
+};
+
+// src/modules/admin/schedule-swaps/schedule-swaps.service.ts
+var listSwaps3 = async (query) => {
+  const { page, limit, status } = query;
+  const skip = (page - 1) * limit;
+  const where = {};
+  if (status) where.status = status;
+  const [swaps, total] = await Promise.all([
+    prisma.swapRequest.findMany({
+      where,
+      skip,
+      take: limit,
+      orderBy: { createdAt: "desc" },
+      select: scheduleSwapSelect
+    }),
+    prisma.swapRequest.count({ where })
+  ]);
+  return {
+    swaps,
+    pagination: { page, limit, total, totalPages: Math.ceil(total / limit) }
+  };
+};
+var getSwapForReview = async (swapId) => {
+  const swap = await prisma.swapRequest.findUnique({
+    where: { id: swapId },
+    select: {
+      id: true,
+      status: true,
+      initiatorUserId: true,
+      initiatorShiftId: true,
+      recipientUserId: true,
+      recipientShiftId: true
+    }
+  });
+  if (!swap) throw new AppError("Swap request not found.", 404);
+  if (swap.status !== "PENDING_ADMIN_APPROVAL") {
+    throw new AppError("Only a swap awaiting admin approval can be reviewed.", 409);
+  }
+  if (!swap.recipientUserId || !swap.recipientShiftId) {
+    throw new AppError("This swap request has no recipient shift.", 409);
+  }
+  return swap;
+};
+var approveSwap3 = async (swapId, adminId, data) => {
+  const swap = await getSwapForReview(swapId);
+  const [initiatorShift, recipientShift] = await Promise.all([
+    prisma.shift.findUnique({
+      where: { id: swap.initiatorShiftId },
+      select: { id: true, userId: true, status: true, endTime: true }
+    }),
+    prisma.shift.findUnique({
+      where: { id: swap.recipientShiftId },
+      select: { id: true, userId: true, status: true, endTime: true }
+    })
+  ]);
+  const usable = (s, owner) => s !== null && s.userId === owner && (s.status === "PENDING" || s.status === "ACCEPTED") && s.endTime > /* @__PURE__ */ new Date();
+  if (!usable(initiatorShift, swap.initiatorUserId) || !usable(recipientShift, swap.recipientUserId)) {
+    throw new AppError(
+      "One of the shifts has changed since this swap was requested; it can no longer be applied.",
+      409
+    );
+  }
+  const now = /* @__PURE__ */ new Date();
+  const [, , , updated] = await prisma.$transaction([
+    // The actual exchange — this is where the main plan changes.
+    prisma.shift.update({
+      where: { id: swap.initiatorShiftId },
+      data: { userId: swap.recipientUserId, status: "ACCEPTED" }
+    }),
+    prisma.shift.update({
+      where: { id: swap.recipientShiftId },
+      data: { userId: swap.initiatorUserId, status: "ACCEPTED" }
+    }),
+    prisma.notification.createMany({
+      data: [swap.initiatorUserId, swap.recipientUserId].map((userId) => ({
+        userId,
+        type: "SWAP_REQUEST_RESULT",
+        channel: "IN_APP",
+        status: "SENT",
+        title: "Swap approved",
+        body: "Your shift swap has been approved by the admin. Check your updated schedule.",
+        sentAt: now,
+        payload: { swapId, result: "APPROVED" }
+      }))
+    }),
+    prisma.swapRequest.update({
+      where: { id: swapId },
+      data: {
+        status: "APPROVED",
+        approvedById: adminId,
+        resolvedAt: now,
+        ...data.reason !== void 0 ? { adminReason: data.reason } : {}
+      },
+      select: scheduleSwapSelect
+    })
+  ]);
+  return updated;
+};
+var rejectSwap3 = async (swapId, adminId, data) => {
+  const swap = await getSwapForReview(swapId);
+  const now = /* @__PURE__ */ new Date();
+  const [, updated] = await prisma.$transaction([
+    prisma.notification.createMany({
+      data: [swap.initiatorUserId, swap.recipientUserId].map((userId) => ({
+        userId,
+        type: "SWAP_REQUEST_RESULT",
+        channel: "IN_APP",
+        status: "SENT",
+        title: "Swap rejected",
+        body: "Your shift swap request was not approved by the admin.",
+        sentAt: now,
+        payload: { swapId, result: "REJECTED" }
+      }))
+    }),
+    prisma.swapRequest.update({
+      where: { id: swapId },
+      data: {
+        status: "REJECTED",
+        approvedById: adminId,
+        resolvedAt: now,
+        ...data.reason !== void 0 ? { adminReason: data.reason } : {}
+      },
+      select: scheduleSwapSelect
+    })
+  ]);
+  return updated;
+};
+var adminScheduleSwapsServices = {
+  listSwaps: listSwaps3,
+  approveSwap: approveSwap3,
+  rejectSwap: rejectSwap3
+};
+
+// src/modules/admin/schedule-swaps/schedule-swaps.controller.ts
+var authAdminId2 = (res) => res.locals.auth.userId;
+var listSwaps4 = async (req, res) => {
+  const query = req.validated;
+  const result = await adminScheduleSwapsServices.listSwaps(query);
+  sendSuccess(res, {
+    statusCode: 200,
+    message: "Schedule swap requests fetched successfully.",
+    data: { swaps: result.swaps },
+    meta: { pagination: result.pagination }
+  });
+};
+var approveSwap4 = async (req, res) => {
+  const swapId = req.params.swapId;
+  const data = req.validated;
+  const swap = await adminScheduleSwapsServices.approveSwap(swapId, authAdminId2(res), data);
+  sendSuccess(res, {
+    statusCode: 200,
+    message: "Swap approved. The two shifts have been exchanged.",
+    data: { swap }
+  });
+};
+var rejectSwap4 = async (req, res) => {
+  const swapId = req.params.swapId;
+  const data = req.validated;
+  const swap = await adminScheduleSwapsServices.rejectSwap(swapId, authAdminId2(res), data);
+  sendSuccess(res, {
+    statusCode: 200,
+    message: "Swap rejected.",
+    data: { swap }
+  });
+};
+
+// src/modules/admin/schedule-swaps/schedule-swaps.route.ts
+var adminScheduleSwapsRouter = Router15();
+adminScheduleSwapsRouter.use(authenticate, authorizeAdmin);
+adminScheduleSwapsRouter.get(
+  "/",
+  validateRequest(listScheduleSwapsQuerySchema),
+  asyncHandler(listSwaps4)
+);
+adminScheduleSwapsRouter.post(
+  "/:swapId/approve",
+  validateRequest(reviewScheduleSwapSchema),
+  asyncHandler(approveSwap4)
+);
+adminScheduleSwapsRouter.post(
+  "/:swapId/reject",
+  validateRequest(reviewScheduleSwapSchema),
+  asyncHandler(rejectSwap4)
+);
+var schedule_swaps_route_default = adminScheduleSwapsRouter;
+
+// src/modules/user/auth/auth.route.ts
+import { Router as Router16 } from "express";
+
+// src/modules/user/auth/auth.validation.ts
+import { z as z16 } from "zod";
+var userLoginSchema = z16.object({
+  email: z16.string({ required_error: "Email is required" }).email("Please provide a valid email address").trim().toLowerCase(),
+  password: z16.string({ required_error: "Password is required" }).min(6, "Password must be at least 6 characters")
+});
+var updateUserProfileSchema = z16.object({
+  email: z16.string().email("Please provide a valid email address").trim().toLowerCase().optional(),
+  currentPassword: z16.string().min(1, "Current password is required").optional(),
+  newPassword: z16.string().min(6, "New password must be at least 6 characters").optional()
+}).refine((d) => d.email !== void 0 || d.newPassword !== void 0, {
+  message: "Provide an email and/or a new password to update."
+}).refine((d) => !d.newPassword || !!d.currentPassword, {
+  message: "currentPassword is required to change the password.",
+  path: ["currentPassword"]
 });
 
 // src/modules/user/auth/auth.service.ts
@@ -5459,6 +7852,50 @@ var getUserProfile = async (userId) => {
     throw new AppError("User not found.", 404);
   }
   return user;
+};
+var updateUserProfile = async (userId, data) => {
+  const user = await prisma.user.findUnique({ where: { id: userId } });
+  if (!user) {
+    throw new AppError("User not found.", 404);
+  }
+  const updateData = {};
+  if (data.email !== void 0 && data.email !== user.email) {
+    const taken = await prisma.user.findUnique({ where: { email: data.email } });
+    if (taken) {
+      throw new AppError("A user with this email already exists.", 409);
+    }
+    updateData.email = data.email;
+  }
+  let passwordChanged = false;
+  if (data.newPassword) {
+    const ok = await verifyPassword(data.currentPassword, user.passwordHash);
+    if (!ok) {
+      throw new AppError("Current password is incorrect.", 401);
+    }
+    updateData.passwordHash = await hashPassword(data.newPassword);
+    updateData.mustChangePassword = false;
+    passwordChanged = true;
+  }
+  const updated = await prisma.user.update({
+    where: { id: userId },
+    data: updateData,
+    select: {
+      id: true,
+      email: true,
+      firstName: true,
+      lastName: true,
+      mustChangePassword: true,
+      isActive: true,
+      updatedAt: true
+    }
+  });
+  if (passwordChanged) {
+    await prisma.userRefreshToken.updateMany({
+      where: { userId, revokedAt: null },
+      data: { revokedAt: /* @__PURE__ */ new Date() }
+    });
+  }
+  return { user: updated, passwordChanged };
 };
 var refreshUserToken = async (oldRefreshToken) => {
   const decoded = jwtUtils.verifyToken(oldRefreshToken, envConfig.REFRESH_TOKEN_SECRET);
@@ -5531,11 +7968,17 @@ var logoutUser = async (refreshToken3) => {
 var userServices = {
   loginUser,
   getUserProfile,
+  updateUserProfile,
   refreshUserToken,
   logoutUser
 };
 
 // src/modules/user/auth/auth.controller.ts
+var clearAuthCookies = (res) => {
+  const opts = { httpOnly: true, secure: true, sameSite: "none", path: "/" };
+  CookieUtils.clearCookie(res, "accessToken", opts);
+  CookieUtils.clearCookie(res, "refreshToken", opts);
+};
 var login2 = async (req, res) => {
   const { email, password } = req.validated;
   const result = await userServices.loginUser(email, password);
@@ -5545,8 +7988,23 @@ var login2 = async (req, res) => {
     statusCode: 200,
     message: "User logged in successfully.",
     data: {
-      user: result.user
+      user: result.user,
+      accessToken: result.accessToken,
+      refreshToken: result.refreshToken
     }
+  });
+};
+var updateProfile2 = async (req, res) => {
+  const { userId } = res.locals.auth;
+  const data = req.validated;
+  const result = await userServices.updateUserProfile(userId, data);
+  if (result.passwordChanged) {
+    clearAuthCookies(res);
+  }
+  sendSuccess(res, {
+    statusCode: 200,
+    message: result.passwordChanged ? "Profile updated. Please log in again with your new password." : "Profile updated successfully.",
+    data: { user: result.user, passwordChanged: result.passwordChanged }
   });
 };
 var getProfile2 = async (_req, res) => {
@@ -5559,7 +8017,7 @@ var getProfile2 = async (_req, res) => {
   });
 };
 var refreshToken2 = async (req, res) => {
-  const oldRefreshToken = req.cookies?.refreshToken;
+  const oldRefreshToken = req.body?.refreshToken || req.cookies?.refreshToken;
   if (!oldRefreshToken) {
     sendError(res, {
       statusCode: 401,
@@ -5572,26 +8030,19 @@ var refreshToken2 = async (req, res) => {
   tokenUtils.setRefreshTokenCookie(res, tokens.refreshToken);
   sendSuccess(res, {
     statusCode: 200,
-    message: "Tokens refreshed successfully."
+    message: "Tokens refreshed successfully.",
+    data: {
+      accessToken: tokens.accessToken,
+      refreshToken: tokens.refreshToken
+    }
   });
 };
 var logout2 = async (req, res) => {
-  const refreshTokenValue = req.cookies?.refreshToken;
+  const refreshTokenValue = req.body?.refreshToken || req.cookies?.refreshToken;
   if (refreshTokenValue) {
     await userServices.logoutUser(refreshTokenValue);
   }
-  CookieUtils.clearCookie(res, "accessToken", {
-    httpOnly: true,
-    secure: true,
-    sameSite: "none",
-    path: "/"
-  });
-  CookieUtils.clearCookie(res, "refreshToken", {
-    httpOnly: true,
-    secure: true,
-    sameSite: "none",
-    path: "/"
-  });
+  clearAuthCookies(res);
   sendSuccess(res, {
     statusCode: 200,
     message: "User logged out successfully."
@@ -5599,35 +8050,42 @@ var logout2 = async (req, res) => {
 };
 
 // src/modules/user/auth/auth.route.ts
-var userAuthRouter = Router12();
+var userAuthRouter = Router16();
 userAuthRouter.post("/login", authLimiter, validateRequest(userLoginSchema), asyncHandler(login2));
 userAuthRouter.post("/refresh", authLimiter, asyncHandler(refreshToken2));
 userAuthRouter.post("/logout", authenticate, asyncHandler(logout2));
-userAuthRouter.get("/profile", authenticate, asyncHandler(getProfile2));
+userAuthRouter.get("/profile", authenticate, authorizeUser, asyncHandler(getProfile2));
+userAuthRouter.patch(
+  "/profile",
+  authenticate,
+  authorizeUser,
+  validateRequest(updateUserProfileSchema),
+  asyncHandler(updateProfile2)
+);
 var auth_route_default2 = userAuthRouter;
 
 // src/modules/user/shifts/shifts.route.ts
-import { Router as Router13 } from "express";
+import { Router as Router17 } from "express";
 
 // src/modules/user/shifts/shifts.validation.ts
-import { z as z13 } from "zod";
-var respondToShiftSchema = z13.object({
-  status: z13.enum(["ACCEPTED", "REJECTED"], {
+import { z as z17 } from "zod";
+var respondToShiftSchema = z17.object({
+  status: z17.enum(["ACCEPTED", "REJECTED"], {
     required_error: "Response status is required",
     invalid_type_error: "status must be either ACCEPTED or REJECTED"
   })
 });
-var shiftIdParamSchema2 = z13.object({
-  shiftId: z13.string({ required_error: "Shift ID is required" }).min(1)
+var shiftIdParamSchema2 = z17.object({
+  shiftId: z17.string({ required_error: "Shift ID is required" }).min(1)
 });
-var listUserShiftsQuerySchema = z13.object({
-  page: z13.coerce.number().int().min(1).default(1),
-  limit: z13.coerce.number().int().min(1).max(100).default(20),
-  categoryId: z13.string().min(1).optional(),
+var listUserShiftsQuerySchema = z17.object({
+  page: z17.coerce.number().int().min(1).default(1),
+  limit: z17.coerce.number().int().min(1).max(100).default(20),
+  categoryId: z17.string().min(1).optional(),
   // Filter by this user's own response state.
-  mine: z13.enum(["accepted", "rejected", "pending"]).optional(),
+  mine: z17.enum(["accepted", "rejected", "pending"]).optional(),
   // Hide shifts that have already ended.
-  upcoming: z13.enum(["true", "false"]).transform((val) => val === "true").optional()
+  upcoming: z17.enum(["true", "false"]).transform((val) => val === "true").optional()
 });
 
 // src/modules/user/shifts/shifts.service.ts
@@ -5762,7 +8220,7 @@ var respondToShift2 = async (req, res) => {
 };
 
 // src/modules/user/shifts/shifts.route.ts
-var userShiftRouter = Router13();
+var userShiftRouter = Router17();
 userShiftRouter.use(authenticate, authorizeUser);
 userShiftRouter.get(
   "/",
@@ -5778,17 +8236,17 @@ userShiftRouter.post(
 var shifts_route_default2 = userShiftRouter;
 
 // src/modules/user/notifications/notifications.route.ts
-import { Router as Router14 } from "express";
+import { Router as Router18 } from "express";
 
 // src/modules/user/notifications/notifications.validation.ts
-import { z as z14 } from "zod";
-var listNotificationsQuerySchema = z14.object({
-  page: z14.coerce.number().int().min(1).default(1),
-  limit: z14.coerce.number().int().min(1).max(100).default(20),
-  unreadOnly: z14.enum(["true", "false"]).transform((val) => val === "true").optional()
+import { z as z18 } from "zod";
+var listNotificationsQuerySchema = z18.object({
+  page: z18.coerce.number().int().min(1).default(1),
+  limit: z18.coerce.number().int().min(1).max(100).default(20),
+  unreadOnly: z18.enum(["true", "false"]).transform((val) => val === "true").optional()
 });
-var notificationIdParamSchema = z14.object({
-  notificationId: z14.string({ required_error: "Notification ID is required" }).min(1)
+var notificationIdParamSchema = z18.object({
+  notificationId: z18.string({ required_error: "Notification ID is required" }).min(1)
 });
 
 // src/modules/user/notifications/notifications.service.ts
@@ -5897,7 +8355,7 @@ var markAllAsRead2 = async (req, res) => {
 };
 
 // src/modules/user/notifications/notifications.route.ts
-var notificationRouter = Router14();
+var notificationRouter = Router18();
 notificationRouter.use(authenticate, authorizeUser);
 notificationRouter.get(
   "/",
@@ -5912,33 +8370,33 @@ notificationRouter.patch(
 var notifications_route_default = notificationRouter;
 
 // src/modules/user/swaps/swaps.route.ts
-import { Router as Router15 } from "express";
+import { Router as Router19 } from "express";
 
 // src/modules/user/swaps/swaps.validation.ts
-import { z as z15 } from "zod";
-var createSwapSchema = z15.object({
+import { z as z19 } from "zod";
+var createSwapSchema = z19.object({
   // The caller's own confirmed shift they want to give away.
-  initiatorShiftId: z15.string({ required_error: "Your shift is required" }).min(1),
+  initiatorShiftId: z19.string({ required_error: "Your shift is required" }).min(1),
   // The colleague to swap with and the confirmed shift of theirs you want.
-  recipientUserId: z15.string({ required_error: "Recipient is required" }).min(1),
-  recipientShiftId: z15.string({ required_error: "Recipient shift is required" }).min(1),
-  reason: z15.string().trim().max(500).optional()
+  recipientUserId: z19.string({ required_error: "Recipient is required" }).min(1),
+  recipientShiftId: z19.string({ required_error: "Recipient shift is required" }).min(1),
+  reason: z19.string().trim().max(500).optional()
 }).refine((d) => d.initiatorShiftId !== d.recipientShiftId, {
   message: "You cannot swap a shift with itself.",
   path: ["recipientShiftId"]
 });
-var swapIdParamSchema2 = z15.object({
-  swapId: z15.string({ required_error: "Swap ID is required" }).min(1)
+var swapIdParamSchema2 = z19.object({
+  swapId: z19.string({ required_error: "Swap ID is required" }).min(1)
 });
-var listUserSwapsQuerySchema = z15.object({
-  page: z15.coerce.number().int().min(1).default(1),
-  limit: z15.coerce.number().int().min(1).max(100).default(20),
-  status: z15.enum(["PENDING", "APPROVED", "REJECTED", "CANCELLED"]).optional(),
-  role: z15.enum(["initiated", "received"]).optional()
+var listUserSwapsQuerySchema = z19.object({
+  page: z19.coerce.number().int().min(1).default(1),
+  limit: z19.coerce.number().int().min(1).max(100).default(20),
+  status: z19.enum(["PENDING", "APPROVED", "REJECTED", "CANCELLED"]).optional(),
+  role: z19.enum(["initiated", "received"]).optional()
 });
 
 // src/modules/user/swaps/swaps.controller.ts
-var createSwap2 = async (req, res) => {
+var createSwap3 = async (req, res) => {
   const userId = res.locals.auth.userId;
   const data = req.validated;
   const swap = await userSwapServices.createSwap(userId, data);
@@ -5948,7 +8406,7 @@ var createSwap2 = async (req, res) => {
     data: { swap }
   });
 };
-var listMySwaps2 = async (req, res) => {
+var listMySwaps3 = async (req, res) => {
   const userId = res.locals.auth.userId;
   const validated = req.validated;
   const query = { page: validated.page, limit: validated.limit };
@@ -5962,7 +8420,7 @@ var listMySwaps2 = async (req, res) => {
     meta: { pagination: result.pagination }
   });
 };
-var cancelSwap2 = async (req, res) => {
+var cancelSwap3 = async (req, res) => {
   const userId = res.locals.auth.userId;
   const swapId = req.params.swapId;
   const swap = await userSwapServices.cancelSwap(userId, swapId);
@@ -5974,44 +8432,44 @@ var cancelSwap2 = async (req, res) => {
 };
 
 // src/modules/user/swaps/swaps.route.ts
-var userSwapRouter = Router15();
+var userSwapRouter = Router19();
 userSwapRouter.use(authenticate, authorizeUser);
 userSwapRouter.post(
   "/",
   validateRequest(createSwapSchema),
-  asyncHandler(createSwap2)
+  asyncHandler(createSwap3)
 );
 userSwapRouter.get(
   "/",
   validateRequest(listUserSwapsQuerySchema),
-  asyncHandler(listMySwaps2)
+  asyncHandler(listMySwaps3)
 );
-userSwapRouter.post("/:swapId/cancel", asyncHandler(cancelSwap2));
+userSwapRouter.post("/:swapId/cancel", asyncHandler(cancelSwap3));
 var swaps_route_default2 = userSwapRouter;
 
 // src/modules/user/availability/availability.route.ts
-import { Router as Router16 } from "express";
+import { Router as Router20 } from "express";
 
 // src/modules/user/availability/availability.validation.ts
-import { z as z16 } from "zod";
-var monthParamSchema = z16.object({
-  year: z16.coerce.number().int().min(2e3).max(2100),
-  month: z16.coerce.number().int().min(1).max(12)
+import { z as z20 } from "zod";
+var monthParamSchema = z20.object({
+  year: z20.coerce.number().int().min(2e3).max(2100),
+  month: z20.coerce.number().int().min(1).max(12)
 });
-var dayEntrySchema = z16.object({
-  date: z16.string({ required_error: "date is required" }).refine((s) => !Number.isNaN(Date.parse(s)), "date must be a valid date"),
-  status: z16.enum(["AVAILABLE", "UNAVAILABLE", "WISH"], {
+var dayEntrySchema = z20.object({
+  date: z20.string({ required_error: "date is required" }).refine((s) => !Number.isNaN(Date.parse(s)), "date must be a valid date"),
+  status: z20.enum(["AVAILABLE", "UNAVAILABLE", "WISH"], {
     required_error: "status is required",
     invalid_type_error: "status must be AVAILABLE, UNAVAILABLE or WISH"
   }),
-  note: z16.string().trim().max(500).optional(),
-  preferredStartTime: z16.string().datetime().optional(),
-  preferredEndTime: z16.string().datetime().optional()
+  note: z20.string().trim().max(500).optional(),
+  preferredStartTime: z20.string().datetime().optional(),
+  preferredEndTime: z20.string().datetime().optional()
 });
-var setDaysSchema = z16.object({
-  year: z16.coerce.number().int().min(2e3).max(2100),
-  month: z16.coerce.number().int().min(1).max(12),
-  days: z16.array(dayEntrySchema).min(1, "Provide at least one day").max(31)
+var setDaysSchema = z20.object({
+  year: z20.coerce.number().int().min(2e3).max(2100),
+  month: z20.coerce.number().int().min(1).max(12),
+  days: z20.array(dayEntrySchema).min(1, "Provide at least one day").max(31)
 });
 
 // src/modules/user/availability/availability.service.ts
@@ -6034,7 +8492,28 @@ var monthSelect = {
     }
   }
 };
+var endOfMonthUTC = (year, month) => new Date(Date.UTC(year, month, 0, 23, 59, 59, 999));
+var isCurrentMonth = (year, month) => {
+  for (const d of [
+    /* @__PURE__ */ new Date(),
+    new Date(Date.now() + 14 * 60 * 60 * 1e3),
+    new Date(Date.now() - 12 * 60 * 60 * 1e3)
+  ]) {
+    if (d.getUTCFullYear() === year && d.getUTCMonth() + 1 === month) return true;
+  }
+  return false;
+};
+var ensureCurrentMonthOpen = async (userId, year, month) => {
+  if (!isCurrentMonth(year, month)) return;
+  await prisma.availabilityMonth.upsert({
+    where: { userId_year_month: { userId, year, month } },
+    create: { userId, year, month, cutoffAt: endOfMonthUTC(year, month) },
+    update: {},
+    select: { id: true }
+  });
+};
 var loadEditableMonth = async (userId, year, month) => {
+  await ensureCurrentMonthOpen(userId, year, month);
   const m = await prisma.availabilityMonth.findUnique({
     where: { userId_year_month: { userId, year, month } },
     select: { id: true, status: true, cutoffAt: true, _count: { select: { days: true } } }
@@ -6050,7 +8529,35 @@ var loadEditableMonth = async (userId, year, month) => {
   }
   return m;
 };
+var listMyMonths = async (userId) => {
+  const months = await prisma.availabilityMonth.findMany({
+    where: { userId },
+    orderBy: [{ year: "desc" }, { month: "desc" }],
+    select: {
+      id: true,
+      year: true,
+      month: true,
+      status: true,
+      cutoffAt: true,
+      submittedAt: true,
+      _count: { select: { days: true } }
+    }
+  });
+  const now = Date.now();
+  return months.map((m) => ({
+    id: m.id,
+    year: m.year,
+    month: m.month,
+    status: m.status,
+    cutoffAt: m.cutoffAt,
+    submittedAt: m.submittedAt,
+    dayCount: m._count.days,
+    // The app can show/hide the "edit availability" action based on this.
+    editable: m.status === "DRAFT" && m.cutoffAt.getTime() > now
+  }));
+};
 var getMyMonth = async (userId, year, month) => {
+  await ensureCurrentMonthOpen(userId, year, month);
   const m = await prisma.availabilityMonth.findUnique({
     where: { userId_year_month: { userId, year, month } },
     select: monthSelect
@@ -6110,12 +8617,22 @@ var submit = async (userId, year, month) => {
   });
 };
 var userAvailabilityServices = {
+  listMyMonths,
   getMyMonth,
   setDays,
   submit
 };
 
 // src/modules/user/availability/availability.controller.ts
+var listMyMonths2 = async (_req, res) => {
+  const userId = res.locals.auth.userId;
+  const months = await userAvailabilityServices.listMyMonths(userId);
+  sendSuccess(res, {
+    statusCode: 200,
+    message: "Availability months fetched successfully.",
+    data: { months }
+  });
+};
 var getMyMonth2 = async (req, res) => {
   const userId = res.locals.auth.userId;
   const year = Number(req.params.year);
@@ -6150,8 +8667,9 @@ var submit2 = async (req, res) => {
 };
 
 // src/modules/user/availability/availability.route.ts
-var userAvailabilityRouter = Router16();
+var userAvailabilityRouter = Router20();
 userAvailabilityRouter.use(authenticate, authorizeUser);
+userAvailabilityRouter.get("/", asyncHandler(listMyMonths2));
 userAvailabilityRouter.get("/:year/:month", asyncHandler(getMyMonth2));
 userAvailabilityRouter.put(
   "/:year/:month/days",
@@ -6161,8 +8679,952 @@ userAvailabilityRouter.put(
 userAvailabilityRouter.post("/:year/:month/submit", asyncHandler(submit2));
 var availability_route_default2 = userAvailabilityRouter;
 
+// src/modules/user/me/me.route.ts
+import { Router as Router21 } from "express";
+
+// src/modules/user/me/me.validation.ts
+import { z as z21 } from "zod";
+var monthString = z21.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/, "month must be in YYYY-MM format").optional();
+var myShiftsQuerySchema = z21.object({
+  month: monthString
+});
+var respondAction = z21.enum(["ACCEPT", "REJECT"], {
+  errorMap: () => ({ message: "action must be ACCEPT or REJECT" })
+});
+var respondShiftSchema = z21.object({
+  shiftId: z21.string({ required_error: "shiftId is required" }).min(1, "shiftId is required"),
+  action: respondAction,
+  reason: z21.string().trim().max(1e3).optional()
+});
+var batchRespondSchema = z21.object({
+  responses: z21.array(
+    z21.object({
+      shiftId: z21.string().min(1, "shiftId is required"),
+      action: respondAction,
+      reason: z21.string().trim().max(1e3).optional()
+    })
+  ).min(1, "Provide at least one response").max(100, "Too many responses in a single request")
+});
+var myHoursQuerySchema = z21.object({
+  month: monthString
+});
+var updateMyProfileSchema = z21.object({
+  firstName: z21.string().trim().optional(),
+  lastName: z21.string().trim().optional(),
+  phone: z21.string().trim().optional(),
+  address: z21.string().trim().optional()
+});
+
+// src/modules/user/me/me.service.ts
+var HOURS_PER_MS5 = 1 / (1e3 * 60 * 60);
+var monthBounds = (month) => {
+  const anchor = month ? /* @__PURE__ */ new Date(`${month}-01T00:00:00.000Z`) : /* @__PURE__ */ new Date();
+  const start = new Date(Date.UTC(anchor.getUTCFullYear(), anchor.getUTCMonth(), 1));
+  const endExclusive = new Date(Date.UTC(anchor.getUTCFullYear(), anchor.getUTCMonth() + 1, 1));
+  return { start, endExclusive };
+};
+var myShiftSelect = {
+  id: true,
+  weeklyPlanId: true,
+  date: true,
+  startTime: true,
+  endTime: true,
+  status: true,
+  rejectionReason: true,
+  actualStartTime: true,
+  actualEndTime: true,
+  actualBreakMinutes: true,
+  category: { select: { id: true, name: true } },
+  weeklyPlan: { select: { status: true, weekStartDate: true, weekEndDate: true } }
+};
+var getMyShifts = async (userId, query) => {
+  const { start, endExclusive } = monthBounds(query.month);
+  const [shifts, unpublishedPlanCount] = await Promise.all([
+    prisma.shift.findMany({
+      where: {
+        userId,
+        date: { gte: start, lt: endExclusive },
+        weeklyPlan: { status: "PUBLISHED" },
+        status: { notIn: ["CANCELLED", "SWAPPED_OUT"] }
+      },
+      orderBy: [{ date: "asc" }, { startTime: "asc" }],
+      select: myShiftSelect
+    }),
+    // Lets the mobile empty state distinguish "no plan exists" from "a plan
+    // exists but hasn't been published yet".
+    prisma.weeklyPlan.count({
+      where: {
+        status: { not: "PUBLISHED" },
+        weekStartDate: { lt: endExclusive },
+        weekEndDate: { gte: start }
+      }
+    })
+  ]);
+  return {
+    month: `${start.toISOString().slice(0, 7)}`,
+    status: "published",
+    hasUnpublishedPlan: unpublishedPlanCount > 0,
+    shifts
+  };
+};
+var respondToShift3 = async (userId, data) => {
+  const shift = await prisma.shift.findUnique({
+    where: { id: data.shiftId },
+    select: {
+      id: true,
+      userId: true,
+      status: true,
+      endTime: true,
+      weeklyPlan: { select: { status: true } }
+    }
+  });
+  if (!shift || shift.userId !== userId) {
+    throw new AppError("Shift not found.", 404);
+  }
+  if (shift.weeklyPlan.status !== "PUBLISHED") {
+    throw new AppError("This shift's schedule has not been published yet.", 409);
+  }
+  if (shift.status !== "PENDING") {
+    throw new AppError("This shift has already been responded to.", 409);
+  }
+  if (shift.endTime <= /* @__PURE__ */ new Date()) {
+    throw new AppError("This shift has already ended.", 409);
+  }
+  const updated = await prisma.shift.update({
+    where: { id: shift.id },
+    data: data.action === "ACCEPT" ? { status: "ACCEPTED", rejectionReason: null } : { status: "REJECTED", rejectionReason: data.reason ?? null },
+    select: myShiftSelect
+  });
+  return updated;
+};
+var batchRespond = async (userId, data) => {
+  const results = [];
+  for (const response of data.responses) {
+    try {
+      await respondToShift3(userId, response);
+      results.push({ shiftId: response.shiftId, success: true });
+    } catch (err) {
+      results.push({
+        shiftId: response.shiftId,
+        success: false,
+        error: err instanceof Error ? err.message : "Unknown error"
+      });
+    }
+  }
+  return {
+    results,
+    succeeded: results.filter((r) => r.success).length,
+    failed: results.filter((r) => !r.success).length
+  };
+};
+var getMyHours = async (userId, query) => {
+  const { start, endExclusive } = monthBounds(query.month);
+  const [shifts, user] = await Promise.all([
+    prisma.shift.findMany({
+      where: {
+        userId,
+        date: { gte: start, lt: endExclusive },
+        weeklyPlan: { status: "PUBLISHED" },
+        status: { in: ["ACCEPTED", "PENDING"] }
+      },
+      orderBy: [{ date: "asc" }, { startTime: "asc" }],
+      select: {
+        id: true,
+        date: true,
+        startTime: true,
+        endTime: true,
+        status: true,
+        actualStartTime: true,
+        actualEndTime: true,
+        actualBreakMinutes: true,
+        category: { select: { id: true, name: true } }
+      }
+    }),
+    prisma.user.findUnique({
+      where: { id: userId },
+      select: { hourlyRate: true, contractedHoursMonthly: true }
+    })
+  ]);
+  const entries = shifts.map((s) => {
+    const plannedHours = (s.endTime.getTime() - s.startTime.getTime()) * HOURS_PER_MS5;
+    const actualHours = s.actualStartTime && s.actualEndTime ? Math.max(
+      0,
+      (s.actualEndTime.getTime() - s.actualStartTime.getTime()) * HOURS_PER_MS5 - (s.actualBreakMinutes ?? 0) / 60
+    ) : null;
+    return {
+      shiftId: s.id,
+      date: s.date,
+      category: s.category,
+      status: s.status,
+      plannedStart: s.startTime,
+      plannedEnd: s.endTime,
+      actualStart: s.actualStartTime,
+      actualEnd: s.actualEndTime,
+      breakMinutes: s.actualBreakMinutes,
+      hours: Number((actualHours ?? plannedHours).toFixed(2))
+    };
+  });
+  const totalHours = Number(entries.reduce((sum, e) => sum + e.hours, 0).toFixed(2));
+  return {
+    month: `${start.toISOString().slice(0, 7)}`,
+    totalHours,
+    targetHours: user?.contractedHoursMonthly ? Number(user.contractedHoursMonthly) : null,
+    hourlyRate: user?.hourlyRate ? Number(user.hourlyRate) : null,
+    entries
+  };
+};
+var updateProfile3 = async (userId, data) => {
+  const user = await prisma.user.update({
+    where: { id: userId },
+    data,
+    select: {
+      id: true,
+      email: true,
+      firstName: true,
+      lastName: true,
+      phone: true,
+      address: true,
+      contractedHoursMonthly: true,
+      hourlyRate: true
+    }
+  });
+  return user;
+};
+var meServices = {
+  getMyShifts,
+  respondToShift: respondToShift3,
+  batchRespond,
+  getMyHours,
+  updateProfile: updateProfile3
+};
+
+// src/modules/user/me/me.controller.ts
+var authUserId = (res) => res.locals.auth.userId;
+var getMyShifts2 = async (req, res) => {
+  const query = req.validated;
+  const result = await meServices.getMyShifts(authUserId(res), query);
+  sendSuccess(res, {
+    statusCode: 200,
+    message: "Your shifts fetched successfully.",
+    data: result
+  });
+};
+var respondToShift4 = async (req, res) => {
+  const data = req.validated;
+  const shift = await meServices.respondToShift(authUserId(res), data);
+  sendSuccess(res, {
+    statusCode: 200,
+    message: `Shift ${data.action === "ACCEPT" ? "accepted" : "rejected"} successfully.`,
+    data: { shift }
+  });
+};
+var batchRespond2 = async (req, res) => {
+  const data = req.validated;
+  const result = await meServices.batchRespond(authUserId(res), data);
+  sendSuccess(res, {
+    statusCode: 200,
+    message: `${result.succeeded} response(s) applied, ${result.failed} failed.`,
+    data: result
+  });
+};
+var getMyHours2 = async (req, res) => {
+  const query = req.validated;
+  const result = await meServices.getMyHours(authUserId(res), query);
+  sendSuccess(res, {
+    statusCode: 200,
+    message: "Your hours fetched successfully.",
+    data: result
+  });
+};
+var updateProfile4 = async (req, res) => {
+  const data = req.validated;
+  const user = await meServices.updateProfile(authUserId(res), data);
+  sendSuccess(res, {
+    statusCode: 200,
+    message: "Profile updated successfully.",
+    data: { user }
+  });
+};
+
+// src/modules/user/me/me.route.ts
+var meRouter = Router21();
+meRouter.use(authenticate, authorizeUser);
+meRouter.get("/shifts", validateRequest(myShiftsQuerySchema), asyncHandler(getMyShifts2));
+meRouter.post(
+  "/shifts/respond",
+  validateRequest(respondShiftSchema),
+  asyncHandler(respondToShift4)
+);
+meRouter.post(
+  "/shifts/batch-respond",
+  validateRequest(batchRespondSchema),
+  asyncHandler(batchRespond2)
+);
+meRouter.get("/hours", validateRequest(myHoursQuerySchema), asyncHandler(getMyHours2));
+meRouter.patch("/profile", validateRequest(updateMyProfileSchema), asyncHandler(updateProfile4));
+var me_route_default = meRouter;
+
+// src/modules/user/attendance/attendance.route.ts
+import { Router as Router22 } from "express";
+
+// src/modules/user/attendance/attendance.validation.ts
+import { z as z22 } from "zod";
+var clockInSchema = z22.object({
+  shiftId: z22.string().min(1).optional(),
+  latitude: z22.coerce.number().min(-90).max(90).optional(),
+  longitude: z22.coerce.number().min(-180).max(180).optional(),
+  location: z22.string().trim().max(500).optional(),
+  note: z22.string().trim().max(1e3).optional()
+});
+var clockOutSchema = z22.object({
+  note: z22.string().trim().max(1e3).optional()
+});
+var historyQuerySchema = z22.object({
+  page: z22.coerce.number().int().min(1).default(1),
+  limit: z22.coerce.number().int().min(1).max(100).default(20),
+  month: z22.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/, "month must be in YYYY-MM format").optional()
+});
+
+// src/modules/user/attendance/attendance.service.ts
+var MINUTES_PER_MS = 1 / (1e3 * 60);
+var entrySelect2 = {
+  id: true,
+  shiftId: true,
+  shift: {
+    select: {
+      id: true,
+      date: true,
+      startTime: true,
+      endTime: true,
+      category: { select: { id: true, name: true } }
+    }
+  },
+  clockInAt: true,
+  clockOutAt: true,
+  breakStartedAt: true,
+  breakMinutes: true,
+  location: true,
+  status: true,
+  workedMinutes: true,
+  lateMinutes: true,
+  overtimeMinutes: true,
+  note: true,
+  createdAt: true
+};
+var findOpenEntry = (userId) => prisma.timeEntry.findFirst({
+  where: { userId, status: { in: ["ACTIVE", "ON_BREAK"] } },
+  select: entrySelect2,
+  orderBy: { clockInAt: "desc" }
+});
+var withElapsed = (entry) => {
+  const now = Date.now();
+  const liveBreakSeconds = entry.status === "ON_BREAK" && entry.breakStartedAt ? Math.floor((now - entry.breakStartedAt.getTime()) / 1e3) : 0;
+  const breakSeconds = entry.breakMinutes * 60 + liveBreakSeconds;
+  const elapsedSeconds = Math.floor((now - entry.clockInAt.getTime()) / 1e3);
+  return {
+    ...entry,
+    elapsedSeconds,
+    breakSeconds,
+    workedSeconds: Math.max(0, elapsedSeconds - breakSeconds)
+  };
+};
+var clockIn = async (userId, data) => {
+  const open = await findOpenEntry(userId);
+  if (open) throw new AppError("You are already clocked in.", 409);
+  let lateMinutes = null;
+  const now = /* @__PURE__ */ new Date();
+  if (data.shiftId) {
+    const shift = await prisma.shift.findUnique({
+      where: { id: data.shiftId },
+      select: {
+        id: true,
+        userId: true,
+        status: true,
+        startTime: true,
+        endTime: true,
+        weeklyPlan: { select: { status: true } }
+      }
+    });
+    if (!shift || shift.userId !== userId) throw new AppError("Shift not found.", 404);
+    if (shift.weeklyPlan.status !== "PUBLISHED") {
+      throw new AppError("This shift's schedule has not been published yet.", 409);
+    }
+    if (shift.status !== "ACCEPTED" && shift.status !== "PENDING") {
+      throw new AppError("You can only clock in to an active (accepted) shift.", 409);
+    }
+    if (now >= shift.endTime) {
+      throw new AppError("This shift has already ended.", 409);
+    }
+    const settings = await prisma.orgSettings.findUnique({
+      where: { id: 1 },
+      select: { earlyClockInWindowMinutes: true }
+    });
+    const windowMinutes = settings?.earlyClockInWindowMinutes ?? 15;
+    const earliest = new Date(shift.startTime.getTime() - windowMinutes * 60 * 1e3);
+    if (now < earliest) {
+      throw new AppError(
+        `You can clock in starting ${windowMinutes} minutes before your shift.`,
+        400
+      );
+    }
+    lateMinutes = Math.max(0, Math.round((now.getTime() - shift.startTime.getTime()) * MINUTES_PER_MS));
+  }
+  const entry = await prisma.timeEntry.create({
+    data: {
+      userId,
+      clockInAt: now,
+      status: "ACTIVE",
+      ...data.shiftId ? { shiftId: data.shiftId } : {},
+      ...data.latitude !== void 0 ? { latitude: data.latitude } : {},
+      ...data.longitude !== void 0 ? { longitude: data.longitude } : {},
+      ...data.location !== void 0 ? { location: data.location } : {},
+      ...data.note !== void 0 ? { note: data.note } : {},
+      ...lateMinutes !== null ? { lateMinutes } : {}
+    },
+    select: entrySelect2
+  });
+  return withElapsed(entry);
+};
+var startBreak = async (userId) => {
+  const open = await findOpenEntry(userId);
+  if (!open) throw new AppError("You are not clocked in.", 409);
+  if (open.status === "ON_BREAK") throw new AppError("You are already on a break.", 409);
+  const entry = await prisma.timeEntry.update({
+    where: { id: open.id },
+    data: { status: "ON_BREAK", breakStartedAt: /* @__PURE__ */ new Date() },
+    select: entrySelect2
+  });
+  return withElapsed(entry);
+};
+var endBreak = async (userId) => {
+  const open = await findOpenEntry(userId);
+  if (!open || open.status !== "ON_BREAK" || !open.breakStartedAt) {
+    throw new AppError("You are not on a break.", 409);
+  }
+  const addedMinutes = Math.max(
+    0,
+    Math.round((Date.now() - open.breakStartedAt.getTime()) * MINUTES_PER_MS)
+  );
+  const entry = await prisma.timeEntry.update({
+    where: { id: open.id },
+    data: {
+      status: "ACTIVE",
+      breakStartedAt: null,
+      breakMinutes: open.breakMinutes + addedMinutes
+    },
+    select: entrySelect2
+  });
+  return withElapsed(entry);
+};
+var clockOut = async (userId, data) => {
+  const open = await findOpenEntry(userId);
+  if (!open) throw new AppError("You are not clocked in.", 409);
+  const now = /* @__PURE__ */ new Date();
+  const extraBreak = open.status === "ON_BREAK" && open.breakStartedAt ? Math.max(0, Math.round((now.getTime() - open.breakStartedAt.getTime()) * MINUTES_PER_MS)) : 0;
+  const breakMinutes = open.breakMinutes + extraBreak;
+  const totalMinutes = Math.max(
+    0,
+    Math.round((now.getTime() - open.clockInAt.getTime()) * MINUTES_PER_MS)
+  );
+  const workedMinutes = Math.max(0, totalMinutes - breakMinutes);
+  const overtimeMinutes = open.shift ? Math.max(0, Math.round((now.getTime() - open.shift.endTime.getTime()) * MINUTES_PER_MS)) : null;
+  const [entry] = await prisma.$transaction([
+    prisma.timeEntry.update({
+      where: { id: open.id },
+      data: {
+        status: "COMPLETED",
+        clockOutAt: now,
+        breakStartedAt: null,
+        breakMinutes,
+        workedMinutes,
+        ...overtimeMinutes !== null ? { overtimeMinutes } : {},
+        ...data.note !== void 0 ? { note: data.note } : {}
+      },
+      select: entrySelect2
+    }),
+    // Mirror actuals onto the roster shift for reporting/hours.
+    ...open.shiftId ? [
+      prisma.shift.update({
+        where: { id: open.shiftId },
+        data: {
+          actualStartTime: open.clockInAt,
+          actualEndTime: now,
+          actualBreakMinutes: breakMinutes
+        }
+      })
+    ] : []
+  ]);
+  return {
+    entry,
+    summary: {
+      workedHours: Number((workedMinutes / 60).toFixed(2)),
+      workedMinutes,
+      breakMinutes,
+      lateMinutes: entry.lateMinutes ?? 0,
+      overtimeMinutes: overtimeMinutes ?? 0
+    }
+  };
+};
+var getCurrentStatus = async (userId) => {
+  const open = await findOpenEntry(userId);
+  return { active: open !== null, entry: open ? withElapsed(open) : null };
+};
+var getHistory = async (userId, query) => {
+  const { page, limit, month } = query;
+  const skip = (page - 1) * limit;
+  const where = { userId, status: "COMPLETED" };
+  if (month) {
+    const anchor = /* @__PURE__ */ new Date(`${month}-01T00:00:00.000Z`);
+    where.clockInAt = {
+      gte: anchor,
+      lt: new Date(Date.UTC(anchor.getUTCFullYear(), anchor.getUTCMonth() + 1, 1))
+    };
+  }
+  const [entries, total] = await Promise.all([
+    prisma.timeEntry.findMany({
+      where,
+      skip,
+      take: limit,
+      orderBy: { clockInAt: "desc" },
+      select: entrySelect2
+    }),
+    prisma.timeEntry.count({ where })
+  ]);
+  const totals = entries.reduce(
+    (acc, e) => {
+      acc.workedMinutes += e.workedMinutes ?? 0;
+      acc.breakMinutes += e.breakMinutes;
+      acc.lateCount += (e.lateMinutes ?? 0) > 0 ? 1 : 0;
+      return acc;
+    },
+    { workedMinutes: 0, breakMinutes: 0, lateCount: 0 }
+  );
+  return {
+    entries,
+    totals: { ...totals, workedHours: Number((totals.workedMinutes / 60).toFixed(2)) },
+    pagination: { page, limit, total, totalPages: Math.ceil(total / limit) }
+  };
+};
+var attendanceServices = {
+  clockIn,
+  clockOut,
+  startBreak,
+  endBreak,
+  getCurrentStatus,
+  getHistory
+};
+
+// src/modules/user/attendance/attendance.controller.ts
+var authUserId2 = (res) => res.locals.auth.userId;
+var clockIn2 = async (req, res) => {
+  const data = req.validated;
+  const entry = await attendanceServices.clockIn(authUserId2(res), data);
+  sendSuccess(res, {
+    statusCode: 201,
+    message: "Clocked in successfully.",
+    data: { entry }
+  });
+};
+var clockOut2 = async (req, res) => {
+  const data = req.validated;
+  const result = await attendanceServices.clockOut(authUserId2(res), data);
+  sendSuccess(res, {
+    statusCode: 200,
+    message: "Clocked out successfully.",
+    data: result
+  });
+};
+var startBreak2 = async (_req, res) => {
+  const entry = await attendanceServices.startBreak(authUserId2(res));
+  sendSuccess(res, {
+    statusCode: 200,
+    message: "Break started.",
+    data: { entry }
+  });
+};
+var endBreak2 = async (_req, res) => {
+  const entry = await attendanceServices.endBreak(authUserId2(res));
+  sendSuccess(res, {
+    statusCode: 200,
+    message: "Break ended.",
+    data: { entry }
+  });
+};
+var getCurrentStatus2 = async (_req, res) => {
+  const result = await attendanceServices.getCurrentStatus(authUserId2(res));
+  sendSuccess(res, {
+    statusCode: 200,
+    message: "Attendance status fetched successfully.",
+    data: result
+  });
+};
+var getHistory2 = async (req, res) => {
+  const query = req.validated;
+  const result = await attendanceServices.getHistory(authUserId2(res), query);
+  sendSuccess(res, {
+    statusCode: 200,
+    message: "Attendance history fetched successfully.",
+    data: { entries: result.entries, totals: result.totals },
+    meta: { pagination: result.pagination }
+  });
+};
+
+// src/modules/user/attendance/attendance.route.ts
+var attendanceRouter = Router22();
+attendanceRouter.use(authenticate, authorizeUser);
+attendanceRouter.post(
+  "/clock-in",
+  validateRequest(clockInSchema),
+  asyncHandler(clockIn2)
+);
+attendanceRouter.post(
+  "/clock-out",
+  validateRequest(clockOutSchema),
+  asyncHandler(clockOut2)
+);
+attendanceRouter.post("/break-start", asyncHandler(startBreak2));
+attendanceRouter.post("/break-end", asyncHandler(endBreak2));
+attendanceRouter.get("/current", asyncHandler(getCurrentStatus2));
+attendanceRouter.get(
+  "/history",
+  validateRequest(historyQuerySchema),
+  asyncHandler(getHistory2)
+);
+var attendance_route_default2 = attendanceRouter;
+
+// src/modules/user/leaves/leaves.route.ts
+import { Router as Router23 } from "express";
+
+// src/modules/user/leaves/leaves.validation.ts
+import { z as z23 } from "zod";
+var dateString5 = (label) => z23.string({ required_error: `${label} is required` }).trim().min(1, `${label} is required`).refine((s) => !Number.isNaN(Date.parse(s)), {
+  message: `${label} must be a valid date`
+});
+var createLeaveSchema = z23.object({
+  leaveType: z23.enum(["VACATION", "SICK", "PERSONAL", "OTHER"], {
+    errorMap: () => ({ message: "leaveType must be VACATION, SICK, PERSONAL or OTHER" })
+  }),
+  startDate: dateString5("Start date"),
+  endDate: dateString5("End date"),
+  reason: z23.string({ required_error: "Reason is required" }).trim().min(10, "Please give a reason of at least 10 characters").max(2e3)
+}).refine((d) => new Date(d.endDate) >= new Date(d.startDate), {
+  message: "endDate must be on or after startDate",
+  path: ["endDate"]
+});
+var myLeavesQuerySchema = z23.object({
+  page: z23.coerce.number().int().min(1).default(1),
+  limit: z23.coerce.number().int().min(1).max(100).default(20),
+  status: z23.enum(["PENDING", "APPROVED", "REJECTED", "CANCELLED"]).optional()
+});
+
+// src/utils/mail/mailer.ts
+import nodemailer from "nodemailer";
+var transporter = null;
+var getTransporter = () => {
+  if (!envConfig.SMTP_HOST || !envConfig.SMTP_USER || !envConfig.SMTP_PASS) return null;
+  if (!transporter) {
+    transporter = nodemailer.createTransport({
+      host: envConfig.SMTP_HOST,
+      port: envConfig.SMTP_PORT ?? 587,
+      secure: (envConfig.SMTP_PORT ?? 587) === 465,
+      auth: { user: envConfig.SMTP_USER, pass: envConfig.SMTP_PASS }
+    });
+  }
+  return transporter;
+};
+var sendEmail = async (options) => {
+  const transport = getTransporter();
+  if (!transport) {
+    logger.info(
+      { to: options.to, subject: options.subject },
+      "SMTP not configured \u2014 email skipped (logged only)"
+    );
+    return false;
+  }
+  try {
+    await transport.sendMail({
+      from: envConfig.SMTP_FROM ?? envConfig.SMTP_USER,
+      to: Array.isArray(options.to) ? options.to.join(", ") : options.to,
+      subject: options.subject,
+      text: options.text,
+      ...options.html ? { html: options.html } : {}
+    });
+    return true;
+  } catch (err) {
+    logger.error({ err, to: options.to, subject: options.subject }, "Failed to send email");
+    return false;
+  }
+};
+
+// src/modules/user/leaves/leaves.service.ts
+var startOfUTCDay6 = (d) => new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+var leaveSelect = {
+  id: true,
+  userId: true,
+  leaveType: true,
+  startDate: true,
+  endDate: true,
+  reason: true,
+  status: true,
+  adminNote: true,
+  reviewedAt: true,
+  createdAt: true,
+  updatedAt: true
+};
+var displayName5 = (u) => u.name ?? ([u.firstName, u.lastName].filter(Boolean).join(" ") || u.email);
+var createLeave = async (userId, data) => {
+  const startDate = startOfUTCDay6(new Date(data.startDate));
+  const endDate = startOfUTCDay6(new Date(data.endDate));
+  const today = startOfUTCDay6(/* @__PURE__ */ new Date());
+  if (endDate < today) {
+    throw new AppError("Leave cannot end in the past.", 400);
+  }
+  const overlapping = await prisma.leaveRequest.findFirst({
+    where: {
+      userId,
+      status: { in: ["PENDING", "APPROVED"] },
+      startDate: { lte: endDate },
+      endDate: { gte: startDate }
+    },
+    select: { id: true, status: true }
+  });
+  if (overlapping) {
+    throw new AppError(
+      `You already have a ${overlapping.status.toLowerCase()} leave request overlapping these dates.`,
+      409
+    );
+  }
+  const [leave, user, admins] = await Promise.all([
+    prisma.leaveRequest.create({
+      data: {
+        userId,
+        leaveType: data.leaveType,
+        startDate,
+        endDate,
+        reason: data.reason
+      },
+      select: leaveSelect
+    }),
+    prisma.user.findUnique({
+      where: { id: userId },
+      select: { name: true, firstName: true, lastName: true, email: true }
+    }),
+    prisma.admin.findMany({
+      where: { isActive: true },
+      select: { email: true }
+    })
+  ]);
+  if (user && admins.length > 0) {
+    const name = displayName5(user);
+    const range = `${leave.startDate.toISOString().slice(0, 10)} to ${leave.endDate.toISOString().slice(0, 10)}`;
+    void sendEmail({
+      to: admins.map((a) => a.email),
+      subject: `New leave request \u2014 ${name}`,
+      text: [
+        `${name} has requested ${data.leaveType.toLowerCase()} leave.`,
+        `Dates: ${range}`,
+        `Reason: ${data.reason}`,
+        "",
+        "Review it in the admin dashboard under Leave Requests."
+      ].join("\n")
+    });
+  }
+  return leave;
+};
+var getMyLeaves = async (userId, query) => {
+  const { page, limit, status } = query;
+  const skip = (page - 1) * limit;
+  const where = { userId };
+  if (status) where.status = status;
+  const [leaves, total] = await Promise.all([
+    prisma.leaveRequest.findMany({
+      where,
+      skip,
+      take: limit,
+      orderBy: { createdAt: "desc" },
+      select: leaveSelect
+    }),
+    prisma.leaveRequest.count({ where })
+  ]);
+  return {
+    leaves,
+    pagination: { page, limit, total, totalPages: Math.ceil(total / limit) }
+  };
+};
+var cancelLeave = async (userId, leaveId) => {
+  const leave = await prisma.leaveRequest.findUnique({
+    where: { id: leaveId },
+    select: { id: true, userId: true, status: true }
+  });
+  if (!leave || leave.userId !== userId) throw new AppError("Leave request not found.", 404);
+  if (leave.status !== "PENDING") {
+    throw new AppError("Only a pending leave request can be cancelled.", 409);
+  }
+  return prisma.leaveRequest.update({
+    where: { id: leaveId },
+    data: { status: "CANCELLED" },
+    select: leaveSelect
+  });
+};
+var leavesServices = {
+  createLeave,
+  getMyLeaves,
+  cancelLeave
+};
+
+// src/modules/user/leaves/leaves.controller.ts
+var authUserId3 = (res) => res.locals.auth.userId;
+var createLeave2 = async (req, res) => {
+  const data = req.validated;
+  const leave = await leavesServices.createLeave(authUserId3(res), data);
+  sendSuccess(res, {
+    statusCode: 201,
+    message: "Leave request submitted. The admin team has been notified.",
+    data: { leave }
+  });
+};
+var getMyLeaves2 = async (req, res) => {
+  const query = req.validated;
+  const result = await leavesServices.getMyLeaves(authUserId3(res), query);
+  sendSuccess(res, {
+    statusCode: 200,
+    message: "Your leave requests fetched successfully.",
+    data: { leaves: result.leaves },
+    meta: { pagination: result.pagination }
+  });
+};
+var cancelLeave2 = async (req, res) => {
+  const leaveId = req.params.leaveId;
+  const leave = await leavesServices.cancelLeave(authUserId3(res), leaveId);
+  sendSuccess(res, {
+    statusCode: 200,
+    message: "Leave request cancelled.",
+    data: { leave }
+  });
+};
+
+// src/modules/user/leaves/leaves.route.ts
+var leavesRouter = Router23();
+leavesRouter.use(authenticate, authorizeUser);
+leavesRouter.post("/", validateRequest(createLeaveSchema), asyncHandler(createLeave2));
+leavesRouter.get("/", validateRequest(myLeavesQuerySchema), asyncHandler(getMyLeaves2));
+leavesRouter.post("/:leaveId/cancel", asyncHandler(cancelLeave2));
+var leaves_route_default2 = leavesRouter;
+
+// src/modules/user/schedule-swaps/schedule-swaps.route.ts
+import { Router as Router24 } from "express";
+
+// src/modules/user/schedule-swaps/schedule-swaps.validation.ts
+import { z as z24 } from "zod";
+var dateString6 = (label) => z24.string({ required_error: `${label} is required` }).trim().min(1, `${label} is required`).refine((s) => !Number.isNaN(Date.parse(s)), {
+  message: `${label} must be a valid date`
+});
+var searchSwapTargetsSchema = z24.object({
+  date: dateString6("Date"),
+  categoryId: z24.string().min(1).optional()
+});
+var createScheduleSwapSchema = z24.object({
+  initiatorShiftId: z24.string({ required_error: "initiatorShiftId is required" }).min(1, "initiatorShiftId is required"),
+  recipientUserId: z24.string({ required_error: "recipientUserId is required" }).min(1, "recipientUserId is required"),
+  recipientShiftId: z24.string({ required_error: "recipientShiftId is required" }).min(1, "recipientShiftId is required")
+});
+var listMySwapsQuerySchema = z24.object({
+  role: z24.enum(["initiated", "received"]).optional(),
+  status: z24.enum([
+    "PENDING_RECIPIENT",
+    "PENDING_ADMIN_APPROVAL",
+    "APPROVED",
+    "REJECTED",
+    "EXPIRED",
+    "CANCELLED"
+  ]).optional(),
+  page: z24.coerce.number().int().min(1).default(1),
+  limit: z24.coerce.number().int().min(1).max(100).default(20)
+});
+var respondSwapSchema = z24.object({
+  action: z24.enum(["ACCEPT", "DECLINE"], {
+    errorMap: () => ({ message: "action must be ACCEPT or DECLINE" })
+  })
+});
+
+// src/modules/user/schedule-swaps/schedule-swaps.controller.ts
+var authUserId4 = (res) => res.locals.auth.userId;
+var searchSwapTargets2 = async (req, res) => {
+  const query = req.validated;
+  const result = await scheduleSwapsServices.searchSwapTargets(authUserId4(res), query);
+  sendSuccess(res, {
+    statusCode: 200,
+    message: "Swappable shifts fetched successfully.",
+    data: result
+  });
+};
+var createSwap4 = async (req, res) => {
+  const data = req.validated;
+  const swap = await scheduleSwapsServices.createSwap(authUserId4(res), data);
+  sendSuccess(res, {
+    statusCode: 201,
+    message: "Swap request sent. The other employee has been notified.",
+    data: { swap }
+  });
+};
+var listMySwaps4 = async (req, res) => {
+  const query = req.validated;
+  const result = await scheduleSwapsServices.listMySwaps(authUserId4(res), query);
+  sendSuccess(res, {
+    statusCode: 200,
+    message: "Your swap requests fetched successfully.",
+    data: { swaps: result.swaps },
+    meta: { pagination: result.pagination }
+  });
+};
+var respondToSwap2 = async (req, res) => {
+  const swapId = req.params.swapId;
+  const data = req.validated;
+  const swap = await scheduleSwapsServices.respondToSwap(authUserId4(res), swapId, data);
+  sendSuccess(res, {
+    statusCode: 200,
+    message: data.action === "ACCEPT" ? "Swap accepted. It now awaits admin approval." : "Swap declined.",
+    data: { swap }
+  });
+};
+var cancelSwap4 = async (req, res) => {
+  const swapId = req.params.swapId;
+  const swap = await scheduleSwapsServices.cancelSwap(authUserId4(res), swapId);
+  sendSuccess(res, {
+    statusCode: 200,
+    message: "Swap request cancelled.",
+    data: { swap }
+  });
+};
+
+// src/modules/user/schedule-swaps/schedule-swaps.route.ts
+var scheduleSwapsRouter = Router24();
+scheduleSwapsRouter.use(authenticate, authorizeUser);
+scheduleSwapsRouter.get(
+  "/search",
+  validateRequest(searchSwapTargetsSchema),
+  asyncHandler(searchSwapTargets2)
+);
+scheduleSwapsRouter.get(
+  "/",
+  validateRequest(listMySwapsQuerySchema),
+  asyncHandler(listMySwaps4)
+);
+scheduleSwapsRouter.post(
+  "/",
+  validateRequest(createScheduleSwapSchema),
+  asyncHandler(createSwap4)
+);
+scheduleSwapsRouter.post(
+  "/:swapId/respond",
+  validateRequest(respondSwapSchema),
+  asyncHandler(respondToSwap2)
+);
+scheduleSwapsRouter.post("/:swapId/cancel", asyncHandler(cancelSwap4));
+var schedule_swaps_route_default2 = scheduleSwapsRouter;
+
 // src/routes/index.route.ts
-var indexRouter = Router17();
+var indexRouter = Router25();
 indexRouter.use("/auth/admin", auth_route_default);
 indexRouter.use("/auth/user", auth_route_default2);
 indexRouter.use("/admin/overview", overview_route_default);
@@ -6175,10 +9637,18 @@ indexRouter.use("/admin/reports", reports_route_default);
 indexRouter.use("/admin/settings", settings_route_default);
 indexRouter.use("/admin/swaps", swaps_route_default);
 indexRouter.use("/admin/availability", availability_route_default);
+indexRouter.use("/admin/scheduling", scheduling_route_default);
+indexRouter.use("/admin/attendance", attendance_route_default);
+indexRouter.use("/admin/leaves", leaves_route_default);
+indexRouter.use("/admin/schedule-swaps", schedule_swaps_route_default);
 indexRouter.use("/shifts", shifts_route_default2);
 indexRouter.use("/notifications", notifications_route_default);
 indexRouter.use("/swaps", swaps_route_default2);
 indexRouter.use("/availability", availability_route_default2);
+indexRouter.use("/me", me_route_default);
+indexRouter.use("/attendance", attendance_route_default2);
+indexRouter.use("/leaves", leaves_route_default2);
+indexRouter.use("/schedule-swaps", schedule_swaps_route_default2);
 var index_route_default = indexRouter;
 
 // src/app.ts

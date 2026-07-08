@@ -1,43 +1,66 @@
 import { z } from 'zod';
-import { apiClient } from '@/lib/api-client';
-import { buildQuery, type ListResponse } from '@/types';
+import api from '@/lib/axios';
+
+// ─── Schemas & Types ────────────────────────────────────────
+
+export const categoryChildSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  isActive: z.boolean(),
+  qualifiedCount: z.number().optional().default(0),
+});
+export type CategoryChild = z.infer<typeof categoryChildSchema>;
+
+export const categoryTreeItemSchema = categoryChildSchema.extend({
+  subCategoryCount: z.number().optional().default(0),
+  children: z.array(categoryChildSchema).optional().default([]),
+  createdAt: z.string().optional(),
+});
+export type CategoryTreeItem = z.infer<typeof categoryTreeItemSchema>;
 
 export const categorySchema = z.object({
   id: z.string(),
   name: z.string(),
-  description: z.string().optional().default(''),
-  defaultRate: z.number().optional().default(0),
-  maxShifts: z.number().optional().default(0),
-  sub: z.array(z.string()).optional().default([]),
-  createdAt: z.string().optional().default(''),
+  isActive: z.boolean(),
+  parentId: z.string().nullable(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
 });
-
 export type Category = z.infer<typeof categorySchema>;
 
-const listSchema = z.object({
-  items: z.array(categorySchema),
-  total: z.number(),
-  page: z.number(),
-  limit: z.number(),
-  totalPages: z.number(),
-});
-
-export interface CategoryFilters {
-  q?: string;
+export interface CategoryTreeResponse {
+  success: boolean;
+  data: {
+    categories: CategoryTreeItem[];
+  };
 }
 
-export type CategoryInput = Omit<Category, 'id' | 'createdAt'>;
+export type CategoryInput = {
+  name: string;
+  isActive?: boolean;
+  parentId?: string;
+};
+
+// ─── Service ────────────────────────────────────────────────
 
 export const categoryService = {
-  getAll: (filters: CategoryFilters = {}): Promise<ListResponse<Category>> =>
-    apiClient.get(`/categories${buildQuery(filters)}`, { schema: listSchema }),
+  /** Fetch the hierarchical tree of categories */
+  getTree: (): Promise<CategoryTreeResponse> =>
+    api.get(`/admin/categories/tree`).then((res) => res.data),
 
-  create: (data: Partial<CategoryInput> & { id?: string; name: string }): Promise<Category> =>
-    apiClient.post('/categories', data, { schema: categorySchema }),
+  /** Create new category (top-level or sub-category if parentId provided) */
+  create: (data: CategoryInput): Promise<{ data: { category: Category } }> =>
+    api.post('/admin/categories', data).then((res) => res.data),
 
-  update: (id: string, data: Partial<CategoryInput>): Promise<Category> =>
-    apiClient.patch(`/categories/${id}`, data, { schema: categorySchema }),
+  /** Add a sub-category directly to a parent (convenience endpoint) */
+  addSubCategory: (parentId: string, data: { name: string }): Promise<{ data: { category: Category } }> =>
+    api.post(`/admin/categories/${parentId}/subcategories`, data).then((res) => res.data),
 
-  remove: (id: string): Promise<{ id: string }> =>
-    apiClient.delete(`/categories/${id}`),
+  /** Update existing category */
+  update: (id: string, data: { name?: string; isActive?: boolean }): Promise<{ data: { category: Category } }> =>
+    api.patch(`/admin/categories/${id}`, data).then((res) => res.data),
+
+  /** Delete category */
+  remove: (id: string): Promise<{ message: string }> =>
+    api.delete(`/admin/categories/${id}`).then((res) => res.data),
 };

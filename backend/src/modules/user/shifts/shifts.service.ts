@@ -3,16 +3,6 @@ import { AppError } from "../../../utils/AppError";
 import type { RespondToShiftInput } from "./shifts.validation";
 import type { Prisma } from "../../../generated/prisma/client";
 
-// A shift offer is auto-removed from the staff app once it is within this
-// window of starting (or already started): staff can no longer see it in the
-// offers list, open it, or accept/decline it. Enforced at query time so it is
-// deterministic on serverless (no background worker needed). This applies only
-// to the open-offers view — a shift the employee is already confirmed for still
-// shows on "My schedule".
-const RESPONSE_CUTOFF_MS = 60_000; // 1 minute
-// The earliest startTime still open to staff: strictly more than 1 min away.
-const openOffersFrom = () => new Date(Date.now() + RESPONSE_CUTOFF_MS);
-
 // Only shifts that have been published (notified) are ever exposed to staff —
 // drafts stay internal to management.
 const buildShiftSelect = (userId: string) =>
@@ -72,11 +62,7 @@ const listAvailableShifts = async (
   const { page, limit, categoryId, mine, upcoming } = query;
   const skip = (page - 1) * limit;
 
-  const where: Prisma.ShiftOfferWhereInput = {
-    notifiedAt: { not: null },
-    // Auto-removed once the shift is within 1 minute of starting.
-    startTime: { gt: openOffersFrom() },
-  };
+  const where: Prisma.ShiftOfferWhereInput = { notifiedAt: { not: null } };
   if (categoryId) where.categoryId = categoryId;
   if (upcoming) where.endTime = { gte: new Date() };
   if (mine === "accepted") where.responses = { some: { userId, status: "ACCEPTED" } };
@@ -103,12 +89,7 @@ const listAvailableShifts = async (
 // ─── Get Single Shift ────────────────────────────────────────────
 const getShiftForUser = async (userId: string, shiftId: string) => {
   const shift = await prisma.shiftOffer.findFirst({
-    where: {
-      id: shiftId,
-      notifiedAt: { not: null },
-      // Removed from the staff app within 1 minute of the start time.
-      startTime: { gt: openOffersFrom() },
-    },
+    where: { id: shiftId, notifiedAt: { not: null } },
     select: buildShiftSelect(userId),
   });
   if (!shift) {
@@ -125,16 +106,14 @@ const respondToShift = async (
 ) => {
   const shift = await prisma.shiftOffer.findFirst({
     where: { id: shiftId, notifiedAt: { not: null } },
-    select: { id: true, startTime: true },
+    select: { id: true, endTime: true },
   });
   if (!shift) {
     throw new AppError("Shift not found.", 404);
   }
 
-  // Closed to responses once within 1 minute of the start (this also covers
-  // shifts that have already started or ended). It has left the staff app.
-  if (shift.startTime.getTime() <= Date.now() + RESPONSE_CUTOFF_MS) {
-    throw new AppError("This shift is no longer open for responses.", 409);
+  if (shift.endTime.getTime() < Date.now()) {
+    throw new AppError("This shift has already ended.", 409);
   }
 
   // A staff member can change their mind up to the shift end, so we upsert.

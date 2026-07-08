@@ -35,6 +35,8 @@ const settingsSelect = {
   sessionTimeoutMinutes: true,
   notificationPrefs: true,
   swapExpiryHours: true,
+  defaultShiftStartTime: true,
+  defaultShiftEndTime: true,
   updatedAt: true,
   updatedById: true,
 } satisfies Prisma.OrgSettingsSelect;
@@ -75,6 +77,10 @@ const updateSettings = async (data: UpdateSettingsInput, adminId: string) => {
   if (data.sessionTimeoutMinutes !== undefined)
     updateData.sessionTimeoutMinutes = data.sessionTimeoutMinutes;
   if (data.swapExpiryHours !== undefined) updateData.swapExpiryHours = data.swapExpiryHours;
+  if (data.defaultShiftStartTime !== undefined)
+    updateData.defaultShiftStartTime = data.defaultShiftStartTime;
+  if (data.defaultShiftEndTime !== undefined)
+    updateData.defaultShiftEndTime = data.defaultShiftEndTime;
 
   // Notification prefs are merged over the current set so a partial update only
   // flips the toggles it names.

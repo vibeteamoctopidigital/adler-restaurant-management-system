@@ -22,4 +22,6 @@ export const settingsService = {
   get: (): Promise<Settings> => apiClient.get('/settings', { schema: settingsSchema }),
   update: (data: Partial<Settings>): Promise<Settings> =>
     apiClient.put('/settings', data, { schema: settingsSchema }),
+  updateProfile: (data: any): Promise<any> =>
+    apiClient.patch('/auth/admin/profile', data),
 };

@@ -1,5 +1,5 @@
-import { Link } from 'react-router-dom';
-import { User as UserIcon, Settings as SettingsIcon, LogOut, Loader2 } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
+import { User as UserIcon, Settings as SettingsIcon, LogOut, Loader2, HelpCircle } from 'lucide-react';
 
 import {
   DropdownMenu,
@@ -15,6 +15,7 @@ import { initials } from '@/lib/utils';
 
 export function UserDropdown() {
   const user = useAuthStore((s) => s.admin);
+  const navigate = useNavigate();
   const { mutate: logout, isPending: isLoggingOut } = useLogout();
 
   return (
@@ -43,15 +44,14 @@ export function UserDropdown() {
           </div>
         </DropdownMenuLabel>
         <DropdownMenuSeparator className="my-1 bg-slate-100" />
-        <DropdownMenuItem asChild className="cursor-pointer rounded-lg mx-0.5 my-0.5">
-          <Link to="/dashboard/profile">
-            <UserIcon className="mr-2 h-4 w-4 text-slate-500" /> Profile
-          </Link>
+        <DropdownMenuItem onSelect={() => navigate('/dashboard/profile')} className="cursor-pointer rounded-lg mx-0.5 my-0.5 text-slate-700 focus:bg-slate-100 focus:text-slate-900 transition-colors">
+          <UserIcon className="mr-2 h-4 w-4 text-slate-500" /> Profile
         </DropdownMenuItem>
-        <DropdownMenuItem asChild className="cursor-pointer rounded-lg mx-0.5 my-0.5">
-          <Link to="/dashboard/settings">
-            <SettingsIcon className="mr-2 h-4 w-4 text-slate-500" /> Settings
-          </Link>
+        <DropdownMenuItem onSelect={() => navigate('/dashboard/settings')} className="cursor-pointer rounded-lg mx-0.5 my-0.5 text-slate-700 focus:bg-slate-100 focus:text-slate-900 transition-colors">
+          <SettingsIcon className="mr-2 h-4 w-4 text-slate-500" /> Settings
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => navigate('/dashboard')} className="cursor-pointer rounded-lg mx-0.5 my-0.5 text-slate-700 focus:bg-slate-100 focus:text-slate-900 transition-colors">
+          <HelpCircle className="mr-2 h-4 w-4 text-slate-500" /> Help & Support
         </DropdownMenuItem>
         <DropdownMenuSeparator className="my-1 bg-slate-100" />
         <DropdownMenuItem

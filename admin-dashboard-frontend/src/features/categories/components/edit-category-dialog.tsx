@@ -11,30 +11,25 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 
 import { useUpdateCategory } from "../hooks/use-categories";
-import type { Category, CategoryInput } from "../api/category.service";
+import type { CategoryTreeItem, CategoryChild } from "../api/category.service";
 
 interface EditCategoryDialogProps {
- 
-  category: Category | null;
+  category: CategoryTreeItem | CategoryChild | null;
   onClose: () => void;
 }
 
-const EMPTY_FORM: CategoryInput = { name: "", description: "", defaultRate: 0, maxShifts: 0, sub: [] };
-
 export function EditCategoryDialog({ category, onClose }: EditCategoryDialogProps) {
   const updateMut = useUpdateCategory();
-  const [form, setForm] = useState<CategoryInput>(EMPTY_FORM);
+  const [form, setForm] = useState<{ name: string; isActive: boolean }>({ name: "", isActive: true });
 
   useEffect(() => {
     if (category) {
       setForm({
         name: category.name,
-        description: category.description,
-        defaultRate: category.defaultRate,
-        maxShifts: category.maxShifts,
-        sub: category.sub,
+        isActive: category.isActive,
       });
     }
   }, [category]);
@@ -59,33 +54,16 @@ export function EditCategoryDialog({ category, onClose }: EditCategoryDialogProp
               className="rounded-xl h-11 border-slate-200 bg-slate-50 focus-visible:ring-blue-500/30 focus-visible:border-blue-400 transition-all"
             />
           </div>
-          <div className="space-y-2">
-            <Label className="font-semibold text-slate-700 text-sm">Description</Label>
-            <Input
-              value={form.description}
-              onChange={(e) => setForm({ ...form, description: e.target.value })}
-              className="rounded-xl h-11 border-slate-200 bg-slate-50 focus-visible:ring-blue-500/30 focus-visible:border-blue-400 transition-all"
+          <div className="flex items-center justify-between rounded-xl border border-slate-200 bg-slate-50 p-4">
+            <div className="space-y-0.5">
+              <Label className="text-base font-semibold text-slate-900">Active Status</Label>
+              <p className="text-xs text-slate-500 font-medium">Inactive categories cannot be assigned</p>
+            </div>
+            <Switch
+              checked={form.isActive}
+              onCheckedChange={(c) => setForm({ ...form, isActive: c })}
+              className="data-[state=checked]:bg-violet-500 data-[state=unchecked]:bg-slate-300"
             />
-          </div>
-          <div className="grid grid-cols-2 gap-3">
-            <div className="space-y-2">
-              <Label className="font-semibold text-slate-700 text-sm">Rate (CHF/h)</Label>
-              <Input
-                type="number"
-                value={form.defaultRate}
-                onChange={(e) => setForm({ ...form, defaultRate: Number(e.target.value) })}
-                className="rounded-xl h-11 border-slate-200 bg-slate-50 focus-visible:ring-blue-500/30 focus-visible:border-blue-400 transition-all"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label className="font-semibold text-slate-700 text-sm">Max shifts/wk</Label>
-              <Input
-                type="number"
-                value={form.maxShifts}
-                onChange={(e) => setForm({ ...form, maxShifts: Number(e.target.value) })}
-                className="rounded-xl h-11 border-slate-200 bg-slate-50 focus-visible:ring-blue-500/30 focus-visible:border-blue-400 transition-all"
-              />
-            </div>
           </div>
         </div>
         <DialogFooter>

@@ -1,13 +1,21 @@
 import { startServer } from "./app";
-
+import bcrypt from "bcrypt";
 import { connectToDatabase, prisma } from "./config/db";
-import { startReminderScheduler } from "./modules/reminders/reminders.service";
 
 
 (async () => {
   await connectToDatabase();
+
+  // const passwordHash = await bcrypt.hash("admin123", 10);
+
+ 
+  //  await prisma.admin.create({
+  //   data: {
+  //     email: "admin@adlersystem.com",
+  //     passwordHash: passwordHash,
+  //   }
+  // });
+
+
   await startServer();
-  // Only the long-lived server runs the in-process reminder scheduler; the
-  // serverless entry (vercel.ts) never calls this — it uses Vercel Cron.
-  startReminderScheduler();
 })();

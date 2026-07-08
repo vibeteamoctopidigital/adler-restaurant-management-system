@@ -9,6 +9,8 @@ import {
   Settings as SettingsIcon,
   ClipboardList,
   UtensilsCrossed,
+  Plane,
+  Clock,
 } from "lucide-react";
 
 import {
@@ -26,14 +28,15 @@ import {
 
 import { Badge } from "@/components/ui/badge";
 import { useAuthStore } from "@/stores/auth.store";
-import { useApprovals } from "@/features/approvals/hooks/use-approvals";
 import { initials } from "@/lib/utils";
+import { useApprovals } from "@/features/approvals/hooks/use-approvals";
 
 const items = [
   { title: "Overview", url: "/dashboard", icon: LayoutDashboard },
-  { title: "Weekly Plan", url: "/dashboard/plans", icon: CalendarRange },
+  { title: "Schedule planner", url: "/dashboard/schedule", icon: CalendarRange },
+  // { title: "Plans", url: "/dashboard/plans", icon: Layers },\
+  { title: "Demands", url: "/dashboard/demands", icon: ClipboardList },
   { title: "Employees", url: "/dashboard/employees", icon: Users },
-  { title: "Workload", url: "/dashboard/workload", icon: ClipboardList },
   { title: "Categories", url: "/dashboard/categories", icon: Layers },
   {
     title: "Shift Approvals",
@@ -41,7 +44,9 @@ const items = [
     icon: ArrowLeftRight,
     approvalsBadge: true,
   },
-  { title: "Reports", url: "/dashboard/reports", icon: BarChart3 },
+  { title: "Attendance", url: "/dashboard/attendance", icon: Clock },
+  { title: "Leave Requests", url: "/dashboard/leaves", icon: Plane },
+  { title: "Reports & Payroll", url: "/dashboard/reports", icon: BarChart3 },
   { title: "Settings", url: "/dashboard/settings", icon: SettingsIcon },
 ];
 
@@ -60,16 +65,15 @@ export function AppSidebar() {
   return (
     <Sidebar
       collapsible="icon"
-      className="bg-[#F1F5F9]/80 backdrop-blur-xl border-r border-[#E2E8F0]"
+      className="bg-[#F1F5F9]/80  backdrop-blur-xl border-r border-[#E2E8F0]"
     >
       {/* ── Header ──────────────────────────────────── */}
-      <SidebarHeader className="h-16 border-b border-[#E2E8F0] bg-transparent">
+      <SidebarHeader className="h-[65px] border-b border-[#E2E8F0] sm:bg-transparent bg-white">
   <div className="flex h-full items-center px-3 group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-0">
     <div className="flex items-center gap-3 group-data-[collapsible=icon]:gap-0">
       <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-blue-600 to-blue-500 text-white shadow-lg shadow-blue-600/25 transition-all duration-200 group-data-[collapsible=icon]:h-9 group-data-[collapsible=icon]:w-9">
         <UtensilsCrossed className="h-5 w-5 group-data-[collapsible=icon]:h-4 group-data-[collapsible=icon]:w-4" />
       </div>
-
       <div className="flex flex-col leading-tight group-data-[collapsible=icon]:hidden">
         <span className="text-lg font-bold tracking-tight text-[#1E293B]">
           ADLER
@@ -81,9 +85,8 @@ export function AppSidebar() {
     </div>
   </div>
 </SidebarHeader>
-
       {/* ── Navigation ──────────────────────────────── */}
-      <SidebarContent className="bg-transparent group-data-[collapsible=icon]:gap-0">
+      <SidebarContent className="sm:bg-transparent bg-white group-data-[collapsible=icon]:gap-0">
         <SidebarGroup className="group-data-[collapsible=icon]:p-0">
           <SidebarGroupLabel className="text-[11px] uppercase tracking-[0.2em] text-[#64748B] font-semibold px-4">
             Workspace
@@ -128,7 +131,7 @@ export function AppSidebar() {
       </SidebarContent>
 
       {/* ── Footer / Profile ────────────────────────── */}
-      <SidebarFooter className="border-t border-[#E2E8F0] bg-transparent group-data-[collapsible=icon]:p-0">
+      <SidebarFooter className="border-t border-[#E2E8F0] sm:bg-transparent bg-white group-data-[collapsible=icon]:p-0">
         <SidebarMenuButton
           asChild
           isActive={pathname === "/dashboard/profile"}

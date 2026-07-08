@@ -1,36 +1,94 @@
 import { useState } from "react";
-import { Mail, Phone, MapPin, Shield, Clock } from "lucide-react";
+import { Mail, Shield, Clock, Loader2, Key } from "lucide-react";
 
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
-import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { toast } from "sonner";
 import { useAuthStore } from "@/stores/auth.store";
-import { useAvailability } from "@/features/plans/hooks/use-availability";
 import { initials, formatDate } from "@/lib/utils";
+import { useMutation } from "@tanstack/react-query";
+import { apiClient } from "@/lib/api-client";
+import { z } from "zod";
+
+const updateProfileSchema = z.object({
+  firstName: z.string().optional(),
+  lastName: z.string().optional(),
+  email: z.string().email().optional(),
+  currentPassword: z.string().optional(),
+  newPassword: z.string().optional(),
+});
+
+type UpdateProfileInput = z.infer<typeof updateProfileSchema>;
 
 export function ProfilePage() {
   const user = useAuthStore((s) => s.admin);
-  const { data, isLoading } = useAvailability(user?.id);
-  const availability = data?.items?.[0];
+  const setUser = useAuthStore((s) => s.setUser);
+  const logout = useAuthStore((s) => s.logout);
 
   const [form, setForm] = useState({
-    name: user?.name ?? "",
+    firstName: user?.firstName ?? "",
+    lastName: user?.lastName ?? "",
     email: user?.email ?? "",
-    phone: "",
-    address: "",
   });
+
+  const [passForm, setPassForm] = useState({
+    currentPassword: "",
+    newPassword: "",
+    confirmPassword: "",
+  });
+
+  const updateMut = useMutation({
+    mutationFn: (data: UpdateProfileInput) => apiClient.patch<{ data: { admin: any; passwordChanged?: boolean } }>('/auth/admin/profile', data),
+    onSuccess: (res) => {
+      if (res.data.passwordChanged) {
+        toast.success("Profile updated. Please log in again with your new password.");
+        logout();
+      } else {
+        toast.success("Profile updated successfully");
+        if (res.data.admin) {
+          setUser({ ...user, ...res.data.admin });
+        }
+      }
+      setPassForm({ currentPassword: "", newPassword: "", confirmPassword: "" });
+    },
+    onError: (err: any) => {
+      toast.error(err?.message || "Failed to update profile");
+    }
+  });
+
+  const handleSaveInfo = () => {
+    updateMut.mutate({
+      firstName: form.firstName,
+      lastName: form.lastName,
+      email: form.email,
+    });
+  };
+
+  const handleSavePassword = () => {
+    if (!passForm.currentPassword || !passForm.newPassword) {
+      toast.error("Please enter both current and new passwords");
+      return;
+    }
+    if (passForm.newPassword !== passForm.confirmPassword) {
+      toast.error("New passwords do not match");
+      return;
+    }
+    updateMut.mutate({
+      currentPassword: passForm.currentPassword,
+      newPassword: passForm.newPassword,
+    });
+  };
 
   return (
     <div className="p-4 md:p-8 space-y-6 max-w-[1100px]">
       <header>
         <p className="text-xs uppercase tracking-widest text-slate-500 font-semibold">Account</p>
         <h1 className="text-3xl md:text-4xl font-bold mt-1 text-slate-900 tracking-tight">Profile</h1>
-        <p className="text-slate-500 mt-1 font-medium">Manage your personal information and availability.</p>
+        <p className="text-slate-500 mt-1 font-medium">Manage your personal information and security.</p>
       </header>
 
       <div className="grid gap-6 md:grid-cols-[320px_1fr]">
@@ -56,42 +114,51 @@ export function ProfilePage() {
         <Tabs defaultValue="info" className="w-full">
           <TabsList className="bg-slate-100/50 p-1 rounded-xl">
             <TabsTrigger value="info" className="rounded-lg font-semibold data-[state=active]:bg-white data-[state=active]:shadow-sm data-[state=active]:text-primary">Personal info</TabsTrigger>
-            <TabsTrigger value="availability" className="rounded-lg font-semibold data-[state=active]:bg-white data-[state=active]:shadow-sm data-[state=active]:text-primary">Availability</TabsTrigger>
+            <TabsTrigger value="security" className="rounded-lg font-semibold data-[state=active]:bg-white data-[state=active]:shadow-sm data-[state=active]:text-primary">Security</TabsTrigger>
           </TabsList>
 
           <TabsContent value="info" className="mt-6">
             <Card className="rounded-2xl border-slate-200 shadow-sm bg-white">
               <CardHeader className="bg-slate-50/50 border-b border-slate-100 pb-4"><CardTitle className="text-lg font-bold text-slate-900">Personal information</CardTitle></CardHeader>
               <CardContent className="grid gap-5 md:grid-cols-2 p-6">
-                <div className="space-y-2"><Label className="font-semibold text-slate-700">Name</Label><Input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} className="rounded-xl h-11 border-slate-200 bg-slate-50" /></div>
-                <div className="space-y-2"><Label className="font-semibold text-slate-700">Email</Label><Input value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} className="rounded-xl h-11 border-slate-200 bg-slate-50" /></div>
-                <div className="space-y-2"><Label className="font-semibold text-slate-700 flex items-center gap-1.5"><Phone className="h-3.5 w-3.5" /> Phone</Label><Input value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} placeholder="017 000 0000" className="rounded-xl h-11 border-slate-200 bg-slate-50" /></div>
-                <div className="space-y-2"><Label className="font-semibold text-slate-700 flex items-center gap-1.5"><MapPin className="h-3.5 w-3.5" /> Address</Label><Input value={form.address} onChange={(e) => setForm({ ...form, address: e.target.value })} placeholder="Street, City" className="rounded-xl h-11 border-slate-200 bg-slate-50" /></div>
+                <div className="space-y-2"><Label className="font-semibold text-slate-700">First Name</Label><Input value={form.firstName} onChange={(e) => setForm({ ...form, firstName: e.target.value })} className="rounded-xl h-11 border-slate-200 bg-slate-50" /></div>
+                <div className="space-y-2"><Label className="font-semibold text-slate-700">Last Name</Label><Input value={form.lastName} onChange={(e) => setForm({ ...form, lastName: e.target.value })} className="rounded-xl h-11 border-slate-200 bg-slate-50" /></div>
+                <div className="space-y-2 md:col-span-2"><Label className="font-semibold text-slate-700">Email</Label><Input value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} className="rounded-xl h-11 border-slate-200 bg-slate-50" /></div>
+                
                 <div className="md:col-span-2 flex justify-end">
-                  <Button onClick={() => toast.success("Profile updated (logged)")} className="rounded-xl font-semibold shadow-md shadow-primary/20">Save changes</Button>
+                  <Button onClick={handleSaveInfo} disabled={updateMut.isPending} className="rounded-xl font-semibold shadow-md shadow-primary/20">
+                    {updateMut.isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                    Save changes
+                  </Button>
                 </div>
               </CardContent>
             </Card>
           </TabsContent>
 
-          <TabsContent value="availability" className="mt-6">
+          <TabsContent value="security" className="mt-6">
             <Card className="rounded-2xl border-slate-200 shadow-sm bg-white">
-              <CardHeader className="bg-slate-50/50 border-b border-slate-100 pb-4"><CardTitle className="text-lg font-bold text-slate-900">Weekly availability</CardTitle></CardHeader>
-              <CardContent className="p-6 space-y-3">
-                {isLoading && Array.from({ length: 7 }).map((_, i) => <Skeleton key={i} className="h-12 rounded-xl" />)}
-                {!isLoading && !availability && <p className="text-slate-500 font-medium text-center py-8">No availability set yet.</p>}
-                {!isLoading && availability?.slots.map((slot) => (
-                  <div key={slot.day} className="flex items-center justify-between rounded-xl border border-slate-200 p-4 bg-white">
-                    <span className="font-bold text-slate-900 w-28">{slot.day}</span>
-                    {slot.available ? (
-                      <span className="text-sm font-medium text-slate-600 bg-blue-50 text-blue-700 px-3 py-1 rounded-lg border border-blue-100">
-                        {slot.timeRange.start} – {slot.timeRange.end}
-                      </span>
-                    ) : (
-                      <span className="text-sm font-medium text-slate-400 bg-slate-50 px-3 py-1 rounded-lg border border-slate-100">Unavailable</span>
-                    )}
+              <CardHeader className="bg-slate-50/50 border-b border-slate-100 pb-4"><CardTitle className="text-lg font-bold text-slate-900 flex items-center gap-2"><Key className="h-5 w-5 text-slate-500" /> Change Password</CardTitle></CardHeader>
+              <CardContent className="space-y-5 p-6">
+                <div className="space-y-2 max-w-md">
+                  <Label className="font-semibold text-slate-700">Current Password</Label>
+                  <Input type="password" value={passForm.currentPassword} onChange={(e) => setPassForm({ ...passForm, currentPassword: e.target.value })} className="rounded-xl h-11 border-slate-200 bg-slate-50" />
+                </div>
+                <div className="grid gap-5 md:grid-cols-2 max-w-2xl">
+                  <div className="space-y-2">
+                    <Label className="font-semibold text-slate-700">New Password</Label>
+                    <Input type="password" value={passForm.newPassword} onChange={(e) => setPassForm({ ...passForm, newPassword: e.target.value })} className="rounded-xl h-11 border-slate-200 bg-slate-50" />
                   </div>
-                ))}
+                  <div className="space-y-2">
+                    <Label className="font-semibold text-slate-700">Confirm New Password</Label>
+                    <Input type="password" value={passForm.confirmPassword} onChange={(e) => setPassForm({ ...passForm, confirmPassword: e.target.value })} className="rounded-xl h-11 border-slate-200 bg-slate-50" />
+                  </div>
+                </div>
+                <div className="flex justify-end max-w-2xl pt-2">
+                  <Button onClick={handleSavePassword} disabled={updateMut.isPending} variant="destructive" className="rounded-xl font-semibold shadow-md">
+                    {updateMut.isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                    Change Password
+                  </Button>
+                </div>
               </CardContent>
             </Card>
           </TabsContent>

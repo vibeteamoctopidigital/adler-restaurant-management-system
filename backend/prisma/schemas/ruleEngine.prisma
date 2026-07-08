@@ -13,6 +13,14 @@ model OrgSettings {
 
   swapExpiryHours Int @default(72)
 
+  // How many minutes before a shift's start an employee may clock in.
+  earlyClockInWindowMinutes Int @default(15)
+
+  // Default shift window ("HH:mm", UTC) applied when generating shifts from
+  // the day-level demand grid, which stores headcount but no times.
+  defaultShiftStartTime String @default("09:00")
+  defaultShiftEndTime   String @default("17:00")
+
   updatedAt   DateTime @updatedAt
   updatedById String?
 

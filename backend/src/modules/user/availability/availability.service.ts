@@ -23,9 +23,43 @@ const monthSelect = {
   },
 } satisfies Prisma.AvailabilityMonthSelect;
 
+// Last moment of the (1-based) month in UTC — the default cut-off when a
+// slot is self-opened rather than opened by an admin.
+const endOfMonthUTC = (year: number, month: number) =>
+  new Date(Date.UTC(year, month, 0, 23, 59, 59, 999));
+
+// Whether (year, month) counts as "the current month" for self-opening.
+// Checked at UTC±(14h/12h) — the extreme timezones — so a device that has
+// already rolled into the new month (or is still in the old one) is never
+// locked out at a month boundary.
+const isCurrentMonth = (year: number, month: number) => {
+  for (const d of [
+    new Date(),
+    new Date(Date.now() + 14 * 60 * 60 * 1000),
+    new Date(Date.now() - 12 * 60 * 60 * 1000),
+  ]) {
+    if (d.getUTCFullYear() === year && d.getUTCMonth() + 1 === month) return true;
+  }
+  return false;
+};
+
+// Staff can always fill in the current month: if management hasn't opened a
+// slot yet, one is created on first access. Admin-opened slots (and their
+// cut-offs) are left untouched; other months still require an admin to open.
+const ensureCurrentMonthOpen = async (userId: string, year: number, month: number) => {
+  if (!isCurrentMonth(year, month)) return;
+  await prisma.availabilityMonth.upsert({
+    where: { userId_year_month: { userId, year, month } },
+    create: { userId, year, month, cutoffAt: endOfMonthUTC(year, month) },
+    update: {},
+    select: { id: true },
+  });
+};
+
 // Availability is only editable while the slot is a DRAFT and the cut-off is
 // still in the future; after that it is binding.
 const loadEditableMonth = async (userId: string, year: number, month: number) => {
+  await ensureCurrentMonthOpen(userId, year, month);
   const m = await prisma.availabilityMonth.findUnique({
     where: { userId_year_month: { userId, year, month } },
     select: { id: true, status: true, cutoffAt: true, _count: { select: { days: true } } },
@@ -74,6 +108,7 @@ const listMyMonths = async (userId: string) => {
 
 // ─── Get my availability for a month ─────────────────────────────
 const getMyMonth = async (userId: string, year: number, month: number) => {
+  await ensureCurrentMonthOpen(userId, year, month);
   const m = await prisma.availabilityMonth.findUnique({
     where: { userId_year_month: { userId, year, month } },
     select: monthSelect,

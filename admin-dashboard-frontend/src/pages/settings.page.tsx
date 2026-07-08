@@ -13,12 +13,19 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { useUpdateSettings } from "@/features/settings/hooks/use-settings";
+import { useUpdateProfile } from "@/features/settings/hooks/use-settings";
 import { useAuthStore } from "@/stores/auth.store";
+import { toast } from "sonner";
 
 export function SettingsPage() {
-  const updateMut = useUpdateSettings();
+  const updateMut = useUpdateProfile();
   const user = useAuthStore((s) => s.admin);
+  const setUser = useAuthStore((s) => s.setUser);
+  const logout = useAuthStore((s) => s.logout);
+
+  // --- Profile form state ---
+  const [name, setName] = useState(user?.name ?? "");
+  const [email, setEmail] = useState(user?.email ?? "");
 
   // --- Change password form state ---
   const [currentPassword, setCurrentPassword] = useState("");
@@ -34,8 +41,21 @@ export function SettingsPage() {
   const [resetSent, setResetSent] = useState(false);
   const [resetError, setResetError] = useState<string | null>(null);
 
-  const save = () => {
-    // handle save logic
+  const save = async () => {
+    if (!name.trim() || !email.trim()) {
+      toast.error("Name and email are required.");
+      return;
+    }
+    
+    try {
+      const res = await updateMut.mutateAsync({ name, email });
+      if (res?.data?.admin) {
+        setUser(res.data.admin);
+      }
+      toast.success(res?.message || "Profile updated successfully.");
+    } catch (err: any) {
+      toast.error(err?.message || "Failed to update profile.");
+    }
   };
 
   const handleChangePassword = async () => {
@@ -53,15 +73,19 @@ export function SettingsPage() {
 
     setIsSavingPassword(true);
     try {
-      // NOTE: wire this up to your real change-password mutation/endpoint.
-      // Reusing updateMut here as a placeholder since it was the only
-      // settings mutation available in this file.
-      await updateMut.mutateAsync({ currentPassword, newPassword });
+      const res = await updateMut.mutateAsync({ currentPassword, newPassword });
+      
+      if (res?.data?.passwordChanged) {
+        toast.success(res.message || "Profile updated. Please log in again with your new password.");
+        logout(); // Revokes session locally and forces user to login screen
+        return;
+      }
+      
       setPasswordSuccess(true);
       setCurrentPassword("");
       setNewPassword("");
-    } catch (err) {
-      setPasswordError(err instanceof Error ? err.message : "Failed to change password.");
+    } catch (err: any) {
+      setPasswordError(err?.message || "Failed to change password.");
     } finally {
       setIsSavingPassword(false);
     }
@@ -112,14 +136,17 @@ export function SettingsPage() {
           <div className="space-y-2">
             <Label className="text-slate-700 font-semibold text-sm">Name</Label>
             <Input
-              defaultValue={user?.name ?? ""}
+              value={name}
+              onChange={(e) => setName(e.target.value)}
               className="rounded-xl border-slate-200 bg-slate-50/50 h-11 focus-visible:ring-blue-500/20 focus-visible:border-blue-300 font-medium transition-all"
             />
           </div>
           <div className="space-y-2">
             <Label className="text-slate-700 font-semibold text-sm">Email</Label>
             <Input
-              defaultValue={user?.email ?? ""}
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
               className="rounded-xl border-slate-200 bg-slate-50/50 h-11 focus-visible:ring-blue-500/20 focus-visible:border-blue-300 font-medium transition-all"
             />
           </div>

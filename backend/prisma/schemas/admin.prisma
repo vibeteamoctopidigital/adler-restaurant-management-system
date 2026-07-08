@@ -19,7 +19,7 @@ model Admin {
   createdShiftOffers   ShiftOffer[]         @relation("ShiftOfferCreatedBy")
   approvedResponses    ShiftOfferResponse[] @relation("ResponseApprovedBy")
   reviewedShiftSwaps   ShiftSwapRequest[]   @relation("ShiftSwapReviewedBy")
-  publishedSchedules   SchedulePublication[] @relation("SchedulePublishedBy")
+  reviewedLeaves       LeaveRequest[]       @relation("LeaveReviewedBy")
 
   @@index([isActive])
   @@index([lastName, firstName])

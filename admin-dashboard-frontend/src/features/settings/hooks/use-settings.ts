@@ -23,3 +23,17 @@ export function useUpdateSettings() {
     },
   });
 }
+
+export function useUpdateProfile() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: any) => settingsService.updateProfile(data),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: settingsKeys.all });
+      if (res?.data?.admin) {
+        // dynamic import or simply rely on the caller to update store if needed, 
+        // but we can just let it be since the page will update its own state or the store directly
+      }
+    },
+  });
+}

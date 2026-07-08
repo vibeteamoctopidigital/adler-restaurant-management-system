@@ -4,12 +4,7 @@
  */
 
 import { useState, useCallback, useMemo } from 'react';
-import { toast } from 'sonner';
-import { Plus, Search } from 'lucide-react';
 
-import { Card, CardContent } from '@/components/ui/card';
-import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
 
 import {
   useEmployees,
@@ -26,10 +21,6 @@ import { EmployeeHeader } from '@/components/employee/employee-header-component'
 import { EmployeeFilters } from '@/components/employee/employee-filters-component';
 import { EmployeeTableContainer } from '@/components/employee/employee-table-container';
 
-// Import refactored sub-components
-
-
-
 // ─────────────────────────────────────────────────────────────
 // MAIN PAGE COMPONENT
 // ─────────────────────────────────────────────────────────────
@@ -41,65 +32,29 @@ export function EmployeesPage() {
   const debouncedSearch = useDebouncedValue(searchQuery, 300);
 
   const [departmentFilter, setDepartmentFilter] = useState('all');
-  const [statusFilter, setStatusFilter] = useState('all');
+  const [isActiveFilter, setIsActiveFilter] = useState('all');
+
+  const [cursor, setCursor] = useState<string | undefined>(undefined);
+  const [cursorStack, setCursorStack] = useState<string[]>([]);
 
   const [modalOpen, setModalOpen] = useState(false);
   const [editingEmployee, setEditingEmployee] = useState<Employee | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Employee | null>(null);
 
+  // Reset pagination when filters change
+  useMemo(() => {
+    setCursor(undefined);
+    setCursorStack([]);
+  }, [debouncedSearch, departmentFilter, isActiveFilter]);
+
   // ─────────────────── QUERIES & MUTATIONS ────────────────────────
 
   const { data, isLoading, isError, isFetching } = useEmployees({
-    q: debouncedSearch || undefined,
-    department: departmentFilter === 'all' ? undefined : departmentFilter,
-    status: statusFilter === 'all' ? undefined : statusFilter,
+    search: debouncedSearch || undefined,
+    isActive: isActiveFilter === 'all' ? undefined : isActiveFilter === 'true',
+    cursor,
+    limit: 10,
   });
-
-
-  const employeesData = {
-    items:[
-        {
-                "id": "emp2",
-                "name": "Jacob Jones",
-                "email": "jacob@example.com",
-                "department": "Kitchen",
-                "designation": "Grill Cook",
-                "employmentType": "Intern",
-                "status": "Active",
-                "salary": 2400,
-                "phone": "0170000002",
-                "address": "5 Bahnhofstrasse, Zurich",
-                "avatar": "https://api.dicebear.com/7.x/notionists/svg?seed=Jacob",
-                "categories": [
-                    "kitchen"
-                ],
-                "contract": "monthly",
-                "workload": 100,
-                "createdAt": "2024-01-06T00:00:00Z"
-            },
-            {
-                "id": "emp3",
-                "name": "Kathryn Murphy",
-                "email": "kathryn@example.com",
-                "department": "Bar",
-                "designation": "Bartender",
-                "employmentType": "Full-time",
-                "status": "Suspension",
-                "salary": 3800,
-                "phone": "0170000003",
-                "address": "22 Lakeside Ave, Lucerne",
-                "avatar": "https://api.dicebear.com/7.x/notionists/svg?seed=Kathryn",
-                "categories": [
-                    "service",
-                    "bar"
-                ],
-                "contract": "monthly",
-                "workload": 100,
-                "createdAt": "2024-01-07T00:00:00Z"
-            },
-    ],
-    total:2
-  }
 
   const createMut = useCreateEmployee();
   const updateMut = useUpdateEmployee();
@@ -110,10 +65,36 @@ export function EmployeesPage() {
 
   // ─────────────────── DATA ────────────────────────
 
-  const employees = employeesData?.items ?? [];
-  const totalCount = employeesData?.total ?? 0;
+  const employees = data?.data?.users ?? [];
+  const totalCount = data?.data?.counts?.active ?? 0;
+  
+  const hasNextPage = data?.meta?.pagination?.hasNextPage ?? false;
+  const nextCursor = data?.meta?.pagination?.nextCursor ?? null;
+  const page = cursorStack.length + 1;
+
+  // Local filtering for department since it's not a backend parameter
+  const filteredEmployees = useMemo(() => {
+    if (departmentFilter === 'all') return employees;
+    return employees.filter(emp => emp.department === departmentFilter);
+  }, [employees, departmentFilter]);
 
   // ─────────────────── HANDLERS ────────────────────────
+
+  const handleNextPage = useCallback(() => {
+    if (hasNextPage && nextCursor) {
+      setCursorStack(prev => [...prev, cursor || '']);
+      setCursor(nextCursor);
+    }
+  }, [hasNextPage, nextCursor, cursor]);
+
+  const handlePrevPage = useCallback(() => {
+    setCursorStack(prev => {
+      const newStack = [...prev];
+      const prevCursor = newStack.pop();
+      setCursor(prevCursor === '' ? undefined : prevCursor);
+      return newStack;
+    });
+  }, []);
 
   const handleOpenAddModal = useCallback(() => {
     setEditingEmployee(null);
@@ -146,8 +127,8 @@ export function EmployeesPage() {
 
   const handleToggleStatus = useCallback(
     (emp: Employee) => {
-      const nextStatus = emp.status === 'Active' ? 'Suspension' : 'Active';
-      statusMut.mutate({ id: emp.id, status: nextStatus });
+      const nextStatus = emp.isActive === false; // If inactive, activate. If active, deactivate.
+      statusMut.mutate({ id: emp.id, isActive: nextStatus });
     },
     [statusMut]
   );
@@ -172,7 +153,7 @@ export function EmployeesPage() {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-50 via-blue-50/30 to-indigo-50/20">
-      <div className="p-4 md:p-8 space-y-6 max-w-[1600px] mx-auto">
+      <div className="p-4 md:p-8 space-y-6 max-w-[1800px] mx-auto">
         {/* Header */}
         <EmployeeHeader onAddClick={handleOpenAddModal} totalCount={totalCount} />
 
@@ -182,14 +163,14 @@ export function EmployeesPage() {
           onSearchChange={setSearchQuery}
           departmentFilter={departmentFilter}
           onDepartmentChange={setDepartmentFilter}
-          statusFilter={statusFilter}
-          onStatusChange={setStatusFilter}
+          isActiveFilter={isActiveFilter}
+          onIsActiveChange={setIsActiveFilter}
           isFetching={isFetching && !isLoading}
         />
 
         {/* Table */}
         <EmployeeTableContainer
-          employees={employees as any}
+          employees={filteredEmployees}
           isLoading={isLoading}
           isError={isError}
           isFetching={isFetching}
@@ -198,6 +179,10 @@ export function EmployeesPage() {
           onToggleStatus={handleToggleStatus}
           onDelete={handleDeleteClick}
           onAdd={handleOpenAddModal}
+          page={page}
+          hasNextPage={hasNextPage}
+          onNextPage={handleNextPage}
+          onPrevPage={handlePrevPage}
         />
 
         {/* Modals */}

@@ -26,7 +26,7 @@ function StaffSkeleton() {
 
 export function RecentStaffCard({ loading, staff }: RecentStaffCardProps) {
   return (
-    <Card className="lg:col-span-2 rounded-2xl border-slate-200 shadow-sm bg-white overflow-hidden">
+    <Card className="lg:col-span-1 col-span-6 rounded-2xl border-slate-200 shadow-sm bg-white overflow-hidden">
       <CardHeader className="bg-slate-50/50 border-b border-slate-100 pb-4">
         <CardTitle className="text-lg font-bold text-slate-900">Recently Added Staff</CardTitle>
         <p className="text-sm font-medium text-slate-500 mt-1">Newest members of the team.</p>

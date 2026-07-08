@@ -1,6 +1,7 @@
 import { prisma } from "../../../config/db";
 import { reportServices } from "../reports/reports.service";
 import { adminSwapServices } from "../swaps/swaps.service";
+import { adminAvailabilityServices } from "../availability/availability.service";
 
 const displayName = (u: {
   name: string | null;
@@ -21,6 +22,8 @@ const dateOnly = (d: Date) => d.toISOString().slice(0, 10);
 // Dashboard "Overview" payload for the admin webapp.
 const getOverview = async () => {
   const now = new Date();
+  const currentYear = now.getFullYear();
+  const currentMonth = now.getMonth() + 1;
 
   const [
     activeEmployees,
@@ -36,6 +39,7 @@ const getOverview = async () => {
     plans,
     recentStaff,
     swapList,
+    availabilityStatus,
   ] = await Promise.all([
     prisma.user.count({ where: { isActive: true } }),
     prisma.user.count({ where: { isActive: false } }),
@@ -88,6 +92,8 @@ const getOverview = async () => {
     }),
     // Pending swaps, already carrying an advisory rule-check result.
     adminSwapServices.listSwaps({ page: 1, limit: 5, status: "PENDING" }),
+    // Monthly availability submission status for the current month.
+    adminAvailabilityServices.getMonthStatus(currentYear, currentMonth),
   ]);
 
   return {
@@ -145,6 +151,13 @@ const getOverview = async () => {
       avatar: null,
       status: u.isActive ? "Active" : "Inactive",
     })),
+    availability: {
+      year: availabilityStatus.year,
+      month: availabilityStatus.month,
+      total: availabilityStatus.summary.total,
+      submitted: availabilityStatus.summary.submitted,
+      notSubmitted: availabilityStatus.summary.notSubmitted,
+    },
   };
 };
 

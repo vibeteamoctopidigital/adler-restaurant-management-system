@@ -1,22 +1,20 @@
 import { AlertTriangle } from "lucide-react";
-import type { Category } from "../api/category.service";
+import type { CategoryTreeItem, CategoryChild } from "../api/category.service";
 import { CategoryItem } from "./category-item";
 import { CategoryCardSkeleton } from "./category-card-skeleton";
 import { CategoryEmptyState } from "./category-empty-state";
 
 interface CategoriesListProps {
-  categories: Category[];
-  staffCountByCategory: Record<string, number>;
+  categories: CategoryTreeItem[];
   isLoading: boolean;
   isError: boolean;
-  onEdit: (category: Category) => void;
-  onDeleteRequest: (category: Category) => void;
+  onEdit: (category: CategoryTreeItem) => void;
+  onDeleteRequest: (category: CategoryTreeItem | CategoryChild) => void;
   onCreateClick: () => void;
 }
 
 export function CategoriesList({
   categories,
-  staffCountByCategory,
   isLoading,
   isError,
   onEdit,
@@ -30,7 +28,7 @@ export function CategoriesList({
           <AlertTriangle className="h-10 w-10 text-red-500" />
         </div>
         <p className="text-red-700 font-semibold">Failed to load categories.</p>
-        <p className="text-slate-500 text-sm mt-1">Is the mock API running? (npm run dev:server)</p>
+        <p className="text-slate-500 text-sm mt-1">Please try again later.</p>
       </div>
     );
   }
@@ -59,7 +57,6 @@ export function CategoriesList({
         <CategoryItem
           key={category.id}
           category={category}
-          staffCount={staffCountByCategory[category.id] ?? 0}
           onEdit={onEdit}
           onDeleteRequest={onDeleteRequest}
         />

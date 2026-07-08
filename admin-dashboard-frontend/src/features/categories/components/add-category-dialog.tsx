@@ -12,6 +12,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 
 import { useCreateCategory } from "../hooks/use-categories";
 
@@ -20,7 +21,7 @@ interface AddCategoryDialogProps {
   onOpenChange: (open: boolean) => void;
 }
 
-const EMPTY_VALUES = { name: "", description: "", defaultRate: 0, maxShifts: 0 };
+const EMPTY_VALUES = { name: "", isActive: true };
 
 export function AddCategoryDialog({ open, onOpenChange }: AddCategoryDialogProps) {
   const createMut = useCreateCategory();
@@ -39,12 +40,8 @@ export function AddCategoryDialog({ open, onOpenChange }: AddCategoryDialogProps
     }
     createMut.mutate(
       {
-        id: name.toLowerCase().replace(/\s+/g, "-"),
         name,
-        description: values.description,
-        defaultRate: values.defaultRate,
-        maxShifts: values.maxShifts,
-        sub: [],
+        isActive: values.isActive,
       },
       { onSuccess: () => handleOpenChange(false) }
     );
@@ -66,34 +63,16 @@ export function AddCategoryDialog({ open, onOpenChange }: AddCategoryDialogProps
               className="rounded-xl h-11 border-slate-200 bg-slate-50 focus-visible:ring-blue-500/30 focus-visible:border-blue-400 transition-all"
             />
           </div>
-          <div className="space-y-2">
-            <Label className="font-semibold text-slate-700 text-sm">Description</Label>
-            <Input
-              value={values.description}
-              onChange={(e) => setValues((v) => ({ ...v, description: e.target.value }))}
-              placeholder="Brief description"
-              className="rounded-xl h-11 border-slate-200 bg-slate-50 focus-visible:ring-blue-500/30 focus-visible:border-blue-400 transition-all"
+          <div className="flex items-center justify-between rounded-xl border border-slate-200 bg-slate-50 p-4">
+            <div className="space-y-0.5">
+              <Label className="text-base font-semibold text-slate-900">Active Status</Label>
+              <p className="text-xs text-slate-500 font-medium">Inactive categories cannot be assigned</p>
+            </div>
+            <Switch
+              checked={values.isActive}
+              onCheckedChange={(c) => setValues((v) => ({ ...v, isActive: c }))}
+              className="data-[state=checked]:bg-violet-500 data-[state=unchecked]:bg-slate-300"
             />
-          </div>
-          <div className="grid grid-cols-2 gap-3">
-            <div className="space-y-2">
-              <Label className="font-semibold text-slate-700 text-sm">Rate (CHF/h)</Label>
-              <Input
-                type="number"
-                value={values.defaultRate}
-                onChange={(e) => setValues((v) => ({ ...v, defaultRate: Number(e.target.value) }))}
-                className="rounded-xl h-11 border-slate-200 bg-slate-50 focus-visible:ring-blue-500/30 focus-visible:border-blue-400 transition-all"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label className="font-semibold text-slate-700 text-sm">Max shifts/wk</Label>
-              <Input
-                type="number"
-                value={values.maxShifts}
-                onChange={(e) => setValues((v) => ({ ...v, maxShifts: Number(e.target.value) }))}
-                className="rounded-xl h-11 border-slate-200 bg-slate-50 focus-visible:ring-blue-500/30 focus-visible:border-blue-400 transition-all"
-              />
-            </div>
           </div>
         </div>
         <DialogFooter>

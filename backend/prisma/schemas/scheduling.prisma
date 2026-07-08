@@ -53,11 +53,16 @@ model Shift {
 
   notifiedAt DateTime?
 
+  // Set when an approved leave request auto-cancelled this shift.
+  leaveRequestId String?
+  leaveRequest   LeaveRequest? @relation(fields: [leaveRequestId], references: [id], onDelete: SetNull)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   swapsAsInitiatorShift SwapRequest[] @relation("InitiatorShift")
   swapsAsRecipientShift SwapRequest[] @relation("RecipientShift")
+  timeEntries           TimeEntry[]
 
   @@index([userId, date])
   @@index([weeklyPlanId])

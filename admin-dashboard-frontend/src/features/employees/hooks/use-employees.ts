@@ -13,8 +13,8 @@ import {
   type Employee,
   type EmployeeFilters,
   type EmployeeInput,
+  type EmployeeListResponse
 } from '../api/employee.service';
-import type { ListResponse } from '@/types';
 
 // ─── Query Keys ────────────────────────────────────────────
 export const employeeKeys = {
@@ -29,7 +29,7 @@ export const employeeKeys = {
 // ─── Queries ───────────────────────────────────────────────
 export function useEmployees(
   filters: EmployeeFilters = {}
-): UseQueryResult<ListResponse<Employee>> {
+): UseQueryResult<EmployeeListResponse> {
   return useQuery({
     queryKey: employeeKeys.list(filters),
     queryFn: () => employeeService.getAll(filters),
@@ -39,7 +39,7 @@ export function useEmployees(
   });
 }
 
-export function useEmployee(id: string): UseQueryResult<Employee> {
+export function useEmployee(id: string): UseQueryResult<{ data: { user: Employee } }> {
   return useQuery({
     queryKey: employeeKeys.detail(id),
     queryFn: () => employeeService.getById(id),
@@ -49,125 +49,116 @@ export function useEmployee(id: string): UseQueryResult<Employee> {
 }
 
 // ─── Mutations ─────────────────────────────────────────────
-export function useCreateEmployee(): UseMutationResult<Employee, Error, EmployeeInput> {
+export function useCreateEmployee(): UseMutationResult<{ data: { user: Employee } }, Error, EmployeeInput> {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (data: EmployeeInput) => employeeService.create(data),
-    onMutate: async (newEmployee) => {
-      await qc.cancelQueries({ queryKey: employeeKeys.lists() });
-      const previousLists = qc.getQueriesData({ queryKey: employeeKeys.lists() });
-      qc.setQueriesData(
-        { queryKey: employeeKeys.lists() },
-        (old: any) => ({
-          ...old,
-          items: old?.items ? [{ id: '__temp__', ...newEmployee }, ...old.items] : [],
-          total: (old?.total ?? 0) + 1,
-        })
-      );
-      return { previousLists };
+    onMutate: async () => {
+      // Opting for simple invalidation on success instead of complex optimistic updates
+      // for creation to avoid guessing ID and other backend-generated fields.
     },
-    onError: (_error, _variables, context: any) => {
-      if (context?.previousLists) {
-        context.previousLists.forEach(([key, data]: any) => qc.setQueryData(key, data));
-      }
-      toast.error('Failed to create employee');
+    onError: (error, _variables, _context: any) => {
+      toast.error(error instanceof Error ? error.message : 'Failed to create employee');
     },
-    onSuccess: (emp) => {
+    onSuccess: (res) => {
+      const emp = res.data.user;
       qc.invalidateQueries({ queryKey: employeeKeys.lists() });
-      toast.success(`✓ ${emp.name} added`);
+      const displayName = [emp.firstName, emp.lastName].filter(Boolean).join(' ') || emp.name || emp.email;
+      toast.success(`✓ ${displayName} added`);
     },
   });
 }
 
 export function useUpdateEmployee(): UseMutationResult<
-  Employee, Error, { id: string; data: Partial<EmployeeInput> }
+  { data: { user: Employee } }, Error, { id: string; data: Partial<EmployeeInput> }
 > {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ id, data }) => employeeService.update(id, data),
     onMutate: async ({ id, data }) => {
       await qc.cancelQueries({ queryKey: employeeKeys.detail(id) });
-      const previousEmployee = qc.getQueryData<Employee>(employeeKeys.detail(id));
-      if (previousEmployee) {
-        qc.setQueryData(employeeKeys.detail(id), { ...previousEmployee, ...data });
+      const previous = qc.getQueryData<{ data: { user: Employee } }>(employeeKeys.detail(id));
+      if (previous) {
+        qc.setQueryData(employeeKeys.detail(id), {
+          ...previous,
+          data: { user: { ...previous.data.user, ...data } }
+        });
       }
-      return { previousEmployee };
+      return { previous };
     },
-    onError: (_error, variables, context: any) => {
-      if (context?.previousEmployee) {
-        qc.setQueryData(employeeKeys.detail(variables.id), context.previousEmployee);
+    onError: (error, variables, context: any) => {
+      if (context?.previous) {
+        qc.setQueryData(employeeKeys.detail(variables.id), context.previous);
       }
-      toast.error('Failed to update employee');
+      toast.error(error instanceof Error ? error.message : 'Failed to update employee');
     },
-    onSuccess: (emp) => {
-      qc.setQueryData(employeeKeys.detail(emp.id), emp);
+    onSuccess: (res) => {
+      qc.setQueryData(employeeKeys.detail(res.data.user.id), res);
       qc.invalidateQueries({ queryKey: employeeKeys.lists() });
-      toast.success(`✓ ${emp.name} updated`);
+      const emp = res.data.user;
+      const displayName = [emp.firstName, emp.lastName].filter(Boolean).join(' ') || emp.name || emp.email;
+      toast.success(`✓ ${displayName} updated`);
     },
   });
 }
 
-export function useDeleteEmployee(): UseMutationResult<{ id: string }, Error, string> {
+export function useDeleteEmployee(): UseMutationResult<{ message: string }, Error, string> {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => employeeService.remove(id),
-    onMutate: async (id) => {
-      await qc.cancelQueries({ queryKey: employeeKeys.lists() });
-      const previousLists = qc.getQueriesData({ queryKey: employeeKeys.lists() });
-      qc.setQueriesData(
-        { queryKey: employeeKeys.lists() },
-        (old: any) => ({
-          ...old,
-          items: old?.items ? old.items.filter((e: Employee) => e.id !== id) : [],
-          total: Math.max(0, (old?.total ?? 0) - 1),
-        })
-      );
-      return { previousLists, deletedId: id };
+    onMutate: async () => {
+      // Opting out of optimistic delete, just invalidate on success
     },
-    onError: (_error, _id, context: any) => {
-      if (context?.previousLists) {
-        context.previousLists.forEach(([key, data]: any) => qc.setQueryData(key, data));
-      }
-      toast.error('Failed to delete employee');
+    onError: (error, _id, _context: any) => {
+      toast.error(error instanceof Error ? error.message : 'Failed to delete employee');
     },
     onSuccess: (_, id) => {
       qc.removeQueries({ queryKey: employeeKeys.detail(id) });
+      qc.invalidateQueries({ queryKey: employeeKeys.lists() });
       toast.success('✓ Employee removed');
     },
   });
 }
 
 export function useUpdateEmployeeStatus(): UseMutationResult<
-  Employee, Error, { id: string; status: Employee['status'] }
+  { data: { user: Employee } }, Error, { id: string; isActive: boolean }
 > {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, status }) => employeeService.updateStatus(id, status),
-    onMutate: async ({ id, status }) => {
+    mutationFn: ({ id, isActive }) =>
+      isActive ? employeeService.activate(id) : employeeService.deactivate(id),
+    onMutate: async ({ id, isActive }) => {
       await qc.cancelQueries({ queryKey: employeeKeys.detail(id) });
-      const previousEmployee = qc.getQueryData<Employee>(employeeKeys.detail(id));
-      if (previousEmployee) {
-        qc.setQueryData(employeeKeys.detail(id), { ...previousEmployee, status });
+      const previous = qc.getQueryData<{ data: { user: Employee } }>(employeeKeys.detail(id));
+      if (previous) {
+        qc.setQueryData(employeeKeys.detail(id), {
+          ...previous,
+          data: { user: { ...previous.data.user, isActive } }
+        });
       }
-      return { previousEmployee };
+      return { previous };
     },
-    onError: (_error, variables, context: any) => {
-      if (context?.previousEmployee) {
-        qc.setQueryData(employeeKeys.detail(variables.id), context.previousEmployee);
+    onError: (error, variables, context: any) => {
+      if (context?.previous) {
+        qc.setQueryData(employeeKeys.detail(variables.id), context.previous);
       }
+      toast.error(error instanceof Error ? error.message : 'Failed to update employee status');
     },
-    onSuccess: (emp) => {
-      qc.setQueryData(employeeKeys.detail(emp.id), emp);
+    onSuccess: (res) => {
+      qc.setQueryData(employeeKeys.detail(res.data.user.id), res);
       qc.invalidateQueries({ queryKey: employeeKeys.lists() });
+      const emp = res.data.user;
+      const displayName = [emp.firstName, emp.lastName].filter(Boolean).join(' ') || emp.name || emp.email;
+      toast.success(`✓ ${displayName} ${res.data.user.isActive ? 'activated' : 'deactivated'}`);
     },
   });
 }
 
 // ─── Utility Hooks ─────────────────────────────────────────
 export function useMutatingIds(
-  createMut: UseMutationResult<Employee, Error, EmployeeInput>,
-  updateMut: UseMutationResult<Employee, Error, { id: string; data: Partial<EmployeeInput> }>,
-  deleteMut: UseMutationResult<{ id: string }, Error, string>
+  createMut: UseMutationResult<{ data: { user: Employee } }, Error, EmployeeInput>,
+  updateMut: UseMutationResult<{ data: { user: Employee } }, Error, { id: string; data: Partial<EmployeeInput> }>,
+  deleteMut: UseMutationResult<{ message: string }, Error, string>
 ): string | null {
   return useMemo(() => {
     if (createMut.isPending) return '__creating__';
@@ -180,3 +171,4 @@ export function useMutatingIds(
 export function useEmployeeStats(employees: Employee[]) {
   return useMemo(() => employeeService.getStats(employees), [employees]);
 }
+

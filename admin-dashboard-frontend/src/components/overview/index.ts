@@ -1,3 +1,4 @@
+export { AvailabilityCard } from './availability-card';
 export { KpiCard } from './kpi-card';
 export { PlanStatusCard } from './plan-status-card';
 export { PendingSwapsCard } from './pending-swaps-card';

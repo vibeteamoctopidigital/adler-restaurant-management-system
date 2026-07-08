@@ -12,9 +12,10 @@ import reportRouter from "../modules/admin/reports/reports.route";
 import settingsRouter from "../modules/admin/settings/settings.route";
 import adminSwapRouter from "../modules/admin/swaps/swaps.route";
 import adminAvailabilityRouter from "../modules/admin/availability/availability.route";
-import adminScheduleRouter from "../modules/admin/schedule/schedule.route";
-import adminReminderRouter from "../modules/reminders/reminders.admin.route";
-import cronReminderRouter from "../modules/reminders/reminders.cron.route";
+import schedulingRouter from "../modules/admin/scheduling/scheduling.route";
+import adminAttendanceRouter from "../modules/admin/attendance/attendance.route";
+import adminLeavesRouter from "../modules/admin/leaves/leaves.route";
+import adminScheduleSwapsRouter from "../modules/admin/schedule-swaps/schedule-swaps.route";
 
 // ── Staff (user) feature routers ───────────────────────────────────
 import userAuthRouter from "../modules/user/auth/auth.route";
@@ -22,8 +23,10 @@ import userShiftRouter from "../modules/user/shifts/shifts.route";
 import notificationRouter from "../modules/user/notifications/notifications.route";
 import userSwapRouter from "../modules/user/swaps/swaps.route";
 import userAvailabilityRouter from "../modules/user/availability/availability.route";
-import userScheduleRouter from "../modules/user/schedule/schedule.route";
-import userHoursRouter from "../modules/user/hours/hours.route";
+import meRouter from "../modules/user/me/me.route";
+import attendanceRouter from "../modules/user/attendance/attendance.route";
+import leavesRouter from "../modules/user/leaves/leaves.route";
+import scheduleSwapsRouter from "../modules/user/schedule-swaps/schedule-swaps.route";
 
 const indexRouter = Router();
 
@@ -42,18 +45,19 @@ indexRouter.use("/admin/reports", reportRouter);
 indexRouter.use("/admin/settings", settingsRouter);
 indexRouter.use("/admin/swaps", adminSwapRouter);
 indexRouter.use("/admin/availability", adminAvailabilityRouter);
-indexRouter.use("/admin/schedule", adminScheduleRouter);
-indexRouter.use("/admin/reminders", adminReminderRouter);
+indexRouter.use("/admin/scheduling", schedulingRouter);
+indexRouter.use("/admin/attendance", adminAttendanceRouter);
+indexRouter.use("/admin/leaves", adminLeavesRouter);
+indexRouter.use("/admin/schedule-swaps", adminScheduleSwapsRouter);
 
 // ── Staff (mobile) ─────────────────────────────────────────────────
 indexRouter.use("/shifts", userShiftRouter);
 indexRouter.use("/notifications", notificationRouter);
 indexRouter.use("/swaps", userSwapRouter);
 indexRouter.use("/availability", userAvailabilityRouter);
-indexRouter.use("/schedule", userScheduleRouter);
-indexRouter.use("/hours", userHoursRouter);
-
-// ── Scheduled jobs (cron-triggered) ────────────────────────────────
-indexRouter.use("/cron/reminders", cronReminderRouter);
+indexRouter.use("/me", meRouter);
+indexRouter.use("/attendance", attendanceRouter);
+indexRouter.use("/leaves", leavesRouter);
+indexRouter.use("/schedule-swaps", scheduleSwapsRouter);
 
 export default indexRouter;

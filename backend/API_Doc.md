@@ -4,7 +4,7 @@
 
 **Health check:** `GET http://localhost:8000/health` → `{ "status": "ok", "uptime": <sec>, "timestamp": "..." }`
 
-**Status:** All 74 endpoints below are implemented and verified end-to-end (automated smoke test, all passing).
+**Status:** All 68 endpoints below are implemented and verified end-to-end (automated smoke test, all passing).
 
 **Example request (cURL):** cookie-based auth — log in once to a cookie jar, then reuse it.
 ```bash
@@ -161,31 +161,9 @@ Each file's role: **`*.route.ts`** wires paths + guards + validation → **`*.co
 15. [Staff — Notifications](#15-staff--notifications)
 16. [Staff — Shift Swaps](#16-staff--shift-swaps)
 17. [Staff — Availability](#17-staff--availability)
-18. [Admin — Schedule Publishing](#18-admin--schedule-publishing)
-19. [Staff — My Schedule](#19-staff--my-schedule)
-20. [Staff — My Hours](#20-staff--my-hours)
-21. [Shift Reminders](#21-shift-reminders)
-22. [Enum Reference](#22-enum-reference)
-23. [Seed Script](#23-seed-script)
+18. [Enum Reference](#18-enum-reference)
+19. [Seed Script](#19-seed-script)
 - 📱 [User Side Doc](#user-side-doc) — staff / React Native mobile API
-- 🧭 [User Site — Requirements Coverage](#user-site--requirements-coverage) — staff user-story → endpoint map
-
----
-
-## User Site — Requirements Coverage
-
-The staff (React Native) user site fulfils six user stories. Each maps to the endpoints below (full request/response specs are in the linked sections). All six were verified end-to-end against the live database — see `implimated.md` §22.
-
-| # | User story | Staff endpoint(s) | Admin side | Behaviour notes |
-|---|-----------|-------------------|-----------|-----------------|
-| 1 | Log in with admin-issued credentials; change own password | `POST /auth/user/login`, `PATCH /auth/user/profile` ([User Side Doc](#user-side-doc)) | employee created in §4 | Password change verifies the current password, re-hashes, **revokes all refresh tokens and ends the session** (re-login required). |
-| 2 | Publish availability on a calendar | `GET /availability`, `GET /availability/:year/:month`, `PUT /availability/:year/:month/days`, `POST /availability/:year/:month/submit` (§17) | admin opens the month (§13) | Editable only while `DRAFT` **and** before the cut-off; submit is binding (read-only after). |
-| 3 | Submitted availability appears in the admin dashboard | — | `GET /admin/availability`, `GET /admin/availability/grid`, `GET /admin/availability/:userId` (§13) | Per-employee status + `filledDays`, and the full day-by-day grid. |
-| 4 | Request a shift swap → admin approves → both sides updated | `POST /swaps`, `GET /swaps`, `POST /swaps/:swapId/cancel` (§16) | `GET /admin/swaps`, `POST /admin/swaps/:swapId/approve` \| `reject` (§8) | Approval **atomically exchanges** the two confirmed shifts and notifies both employees (`SWAP_REQUEST_RESULT`). |
-| 5 | See the published schedule, sortable by date / week / month | `GET /schedule?view=day\|week\|month`, `GET /schedule/months` (§19) | `POST /admin/schedule/publish` \| `unpublish`, `GET /admin/schedule` (§18) | Confirmed shifts are visible **only after the month is published**; drafts stay hidden ("not published yet"). |
-| 6 | Accept/reject posted jobs; jobs auto-removed 1 min before start | `GET /shifts`, `GET /shifts/:shiftId`, `POST /shifts/:shiftId/respond` (§14) | `POST /admin/shifts` + `/notify` (§6) | A job leaves the staff app **within 1 minute** of its start (query-time cutoff: list omits it, `GET`→`404`, respond→`409`). Never deleted — the admin still sees it. |
-| + | See own hours for payroll (Hours tab) | `GET /hours?year=&month=` (§20) | hours derive from admin approvals (§7) | Own worked-so-far vs. scheduled vs. contracted target + per-shift breakdown. |
-| + | Reminder notifications 5 h / 3 h / 1 h before a shift | arrives in `GET /notifications` as `SHIFT_REMINDER` (§15) | scheduler → `/cron/reminders`; admin `/admin/reminders/*` (§21) | Idempotent dispatch; late-confirmed shifts only get still-relevant reminders. |
 
 ---
 
@@ -864,10 +842,8 @@ Body: `{ "year": 2026, "month": 12 }`. Sends the employee an `AVAILABILITY_REMIN
 ## 14. Staff — Shifts
 Base path `/shifts`. Staff-guarded (mobile app). Only **published** shifts (notified) are ever visible here.
 
-> **Auto-removal (1-minute cutoff).** A job leaves the staff app once it is **within 1 minute of its start time** (or has already started): it stops appearing in the list, `GET /shifts/:id` returns `404`, and responding returns `409`. This is enforced at query time (deterministic on serverless — no background job), and it only affects the **open-offers** view. A shift the employee is already confirmed for still appears on **My Schedule** (§19). The admin's own views (§6/§7) are unaffected — the shift is never deleted.
-
 ### `GET http://localhost:8000/api/v1/shifts`  · available shifts
-Only shifts whose `startTime` is **more than 1 minute away** are returned. Query: `page`, `limit`, `categoryId`, `mine` (`accepted` \| `rejected` \| `pending`), `upcoming` (`true`/`false`).
+Query: `page`, `limit`, `categoryId`, `mine` (`accepted` \| `rejected` \| `pending`), `upcoming` (`true`/`false`).
 ```json
 { "success": true, "data": { "shifts": [
     { "id": "…", "jobTitle": "Evening Waiter", "startTime": "…", "endTime": "…", "hourlyPrice": "28",
@@ -879,11 +855,11 @@ Only shifts whose `startTime` is **more than 1 minute away** are returned. Query
 - `myResponse` is `null` if the caller hasn't responded. `approvalStatus` reflects whether the admin confirmed them.
 - `confirmedCount` = number of admin-approved workers on the shift.
 
-### `GET http://localhost:8000/api/v1/shifts/:shiftId`  · one published shift (same shape) · `404` if not published/found/within the 1-minute cutoff
+### `GET http://localhost:8000/api/v1/shifts/:shiftId`  · one published shift (same shape) · `404` if not published/found
 ### `POST http://localhost:8000/api/v1/shifts/:shiftId/respond`  · accept / decline
-Body: `{ "status": "ACCEPTED" }` or `{ "status": "REJECTED" }`. Upsert — staff may change their mind until the shift reaches the 1-minute cutoff.
+Body: `{ "status": "ACCEPTED" }` or `{ "status": "REJECTED" }`. Upsert — staff may change their mind up to the shift end.
 `200` → `{ "data": { "response": { "id": "…", "shiftOfferId": "…", "status": "ACCEPTED", "respondedAt": "…" } } }`
-Errors: `400` bad enum · `404` shift not published · `409` shift within 1 minute of starting / already started ("This shift is no longer open for responses.").
+Errors: `400` bad enum · `404` shift not published · `409` shift already ended.
 
 ---
 
@@ -976,166 +952,7 @@ Moves `DRAFT → SUBMITTED` and stamps `submittedAt`. After this the month is re
 
 ---
 
-## 18. Admin — Schedule Publishing
-Base path `/admin/schedule`. Admin-guarded. A month's confirmed schedule is **hidden from staff until an admin publishes it** — management plans and confirms shifts privately, then publishes the month in one action. "Confirmed" shifts are admin-**APPROVED** shift-offer acceptances (§7) whose `startTime` falls in the month.
-
-### `POST http://localhost:8000/api/v1/admin/schedule/publish`  · publish a month
-```json
-{ "year": 2026, "month": 8, "note": "August roster final" }
-```
-| Field | Rules |
-|-------|-------|
-| `year` | int 2000–2100 |
-| `month` | int 1–12 |
-| `note` | ≤ 500 chars, optional |
-Flips the month to `PUBLISHED` (upsert; stamps `publishedAt` + `publishedById`) and sends a `WEEKLY_SHIFTS_PUBLISHED` in-app notification to **every active employee confirmed for ≥1 shift that month**. Re-publishing re-notifies.
-`200`:
-```json
-{ "success": true, "message": "Schedule published. Notified 1 employee(s).",
-  "data": {
-    "publication": { "id": "…", "year": 2026, "month": 8, "status": "PUBLISHED", "note": "…", "publishedAt": "…", "publishedById": "…", "createdAt": "…", "updatedAt": "…" },
-    "notifiedCount": 1,
-    "summary": { "confirmedShifts": 1, "employeesScheduled": 1, "scheduledHours": 6.5 } } }
-```
-
-### `POST http://localhost:8000/api/v1/admin/schedule/unpublish`  · hide a month again
-Body: `{ "year": 2026, "month": 8 }`. Takes a published month back to `DRAFT` (clears `publishedAt`) so staff no longer see it. `409` if the month is not currently published.
-
-### `GET http://localhost:8000/api/v1/admin/schedule?year=2026&month=8`  · month status + summary
-`year`/`month` optional — defaults to the current month.
-```json
-{ "success": true, "data": {
-    "year": 2026, "month": 8, "label": "August 2026",
-    "status": "PUBLISHED",
-    "publication": { "id": "…", "status": "PUBLISHED", "publishedAt": "…", … },
-    "summary": { "confirmedShifts": 1, "employeesScheduled": 1, "scheduledHours": 6.5 } } }
-```
-`status` is `PUBLISHED` \| `DRAFT` \| `NOT_PUBLISHED` (the last = no publication row exists yet). `publication` is `null` when never touched.
-
-### `GET http://localhost:8000/api/v1/admin/schedule/publications`  · publication history
-Query: `page`, `limit` (default 20), `status` (`DRAFT` \| `PUBLISHED`). Newest-first list of publication rows, each with a `label`.
-
----
-
-## 19. Staff — My Schedule
-Base path `/schedule`. Staff-guarded (mobile app). The employee's **confirmed** schedule (the shifts an admin approved them for), and **only for months that have been published** (§18). Until then the month reads as "not published yet" — drafts are never exposed.
-
-### `GET http://localhost:8000/api/v1/schedule`  · my schedule (sort by day / week / month)
-The **Schedule** tab. Sortable via `view`, matching the workload/demands convention.
-| Query | Rules |
-|-------|-------|
-| `view` | `day` \| `week` \| `month` (default `month`) |
-| `date` | reference date (any day in the target period); defaults to today |
-| `year` + `month` | alternative to `date` for the month switcher — **both or neither** (`400` otherwise) |
-
-- `day` → the single day. `week` → the **Monday-based** week containing the reference date. `month` → the calendar month.
-- A month is only included if it has been **published**; otherwise its shifts are withheld and `published` is `false` (a `week` view can straddle two months — each is gated independently, and `months[]` reports the per-month state).
-
-**Published month** (`view=month`, August 2026):
-```json
-{ "success": true, "message": "Schedule fetched successfully.", "data": {
-    "view": "month",
-    "range": { "start": "2026-08-01", "end": "2026-08-31" },
-    "period": { "year": 2026, "month": 8, "label": "August 2026" },
-    "published": true, "publishedAt": "…",
-    "months": [ { "year": 2026, "month": 8, "label": "August 2026", "published": true, "publishedAt": "…" } ],
-    "totals": { "shiftCount": 1, "scheduledHours": 6.5 },
-    "groups": [
-      { "date": "2026-08-08", "hours": 6.5, "shifts": [
-        { "id": "…", "jobTitle": "Evening Waiter", "category": { "id": "…", "name": "Service" },
-          "startTime": "2026-08-08T17:00:00.000Z", "endTime": "2026-08-08T23:30:00.000Z",
-          "hours": 6.5, "hourlyPrice": "28", "description": null, "confirmedAt": "…" } ] } ],
-    "shifts": [ "… the same shift objects, flat, ordered by startTime …" ] } }
-```
-**Unpublished month** (drives the *"August isn't published yet"* empty state):
-```json
-{ "success": true, "message": "Schedule is not published yet.", "data": {
-    "view": "month", "range": { "start": "2026-08-01", "end": "2026-08-31" },
-    "period": { "year": 2026, "month": 8, "label": "August 2026" },
-    "published": false, "publishedAt": null,
-    "months": [ { "year": 2026, "month": 8, "label": "August 2026", "published": false, "publishedAt": null } ],
-    "totals": { "shiftCount": 0, "scheduledHours": 0 }, "groups": [], "shifts": [] } }
-```
-- `groups` bucket the shifts by calendar day (each with its own `hours`); `shifts` is the same set flat, ordered by `startTime`. `totals.scheduledHours` powers the "hours so far" figure.
-- `period` + top-level `publishedAt` are present only for single-month windows (`day`/`month`, or a `week` inside one month).
-
-### `GET http://localhost:8000/api/v1/schedule/months`  · published months (month switcher)
-Published months only, newest-first — for the app's month picker.
-```json
-{ "success": true, "data": { "months": [ { "year": 2026, "month": 8, "publishedAt": "…", "label": "August 2026" } ] } }
-```
-
----
-
-## 20. Staff — My Hours
-Base path `/hours`. Staff-guarded (mobile app). An employee's own **hours for payroll** for a month — the mobile **Hours** tab. Hours come from the employee's admin-**APPROVED** shift-offer acceptances that fall in the month (same source as the admin Reports, scoped to the caller). There is no separate time-clock yet, so a shift's hours are its scheduled duration; a shift counts as **worked** once it has ended.
-
-### `GET http://localhost:8000/api/v1/hours?year=2026&month=7`  · my hours for a month
-`year`/`month` are optional and default to the **current month**.
-```json
-{ "success": true, "message": "Hours fetched successfully.", "data": {
-    "period": { "year": 2026, "month": 7, "label": "July 2026" },
-    "summary": {
-      "workedHours": 24.2,        // completed shifts so far (ended)
-      "scheduledHours": 30.9,     // all confirmed shifts this month
-      "targetHours": 182,         // contracted hours ("Target 100%")
-      "workloadPercent": 100,
-      "overtimeHours": 0,         // max(0, scheduled − target)
-      "remainingHours": 151.1,    // max(0, target − scheduled)  (null if no contract)
-      "shiftCount": 4,
-      "contractType": "HOURLY",
-      "hourlyRate": 28,
-      "estimatedEarnings": 677.6  // own-data estimate: workedHours × hourlyRate (or fixed salary)
-    },
-    "shifts": [
-      { "id": "…", "jobTitle": "Evening", "category": { "id": "…", "name": "Service" },
-        "startTime": "2026-07-01T17:00:00.000Z", "endTime": "2026-07-01T23:42:00.000Z",
-        "hours": 6.7, "hourlyPrice": "28", "completed": true, "confirmedAt": "…" }
-    ] } }
-```
-- `shifts` are ordered by `startTime`; each has a `completed` flag (its end time has passed).
-- `workedHours` sums only **completed** shifts (the "July so far" figure); `scheduledHours` sums all confirmed shifts in the month.
-- `targetHours` is the caller's `contractedHoursMonthly` (`null` if not set); `remainingHours`/`overtimeHours` are computed against it.
-- `estimatedEarnings` is the caller's **own** estimate (hourly staff by worked hours, salaried by fixed salary), `null` if neither rate is set.
-
----
-
-## 21. Shift Reminders
-Confirmed shifts trigger automatic reminder notifications **5 hours, 3 hours, and 1 hour** before the shift's `startTime`. A "confirmed shift" is a shift offer the employee is admin-**APPROVED** for (§7). Each reminder is delivered as an in-app `Notification` (`type: SHIFT_REMINDER`) that the employee reads via the normal notifications API (§15) — the mobile app just shows it.
-
-**How it fires (serverless-safe).** A scheduler calls the dispatch endpoint periodically (Vercel Cron is configured for every 15 min); each run scans confirmed shifts starting within 5 hours and sends any reminder that has just become due. Delivery is **idempotent** — a `shift_reminders` ledger row per `(confirmed shift, offset)` guarantees each reminder is sent **exactly once**, even across overlapping/retried runs. A shift confirmed *late* (e.g. 2 h before start) silently skips its already-past 5 h/3 h reminders and only fires the still-relevant ones. On a long-lived (self-hosted) server an in-process scheduler runs the same dispatch automatically (`REMINDER_INPROCESS_CRON=true`).
-
-### `GET|POST http://localhost:8000/api/v1/cron/reminders`  · scheduler-triggered dispatch
-Guarded by the shared **`CRON_SECRET`** (sent as `Authorization: Bearer <CRON_SECRET>` or an `x-cron-secret` header) — **not** JWT. Vercel Cron adds the header automatically. Scans and sends all due reminders.
-```json
-{ "success": true, "message": "Dispatched 3 reminder(s).",
-  "data": { "at": "2026-07-10T13:00:00.000Z", "scannedResponses": 8, "sent": 3,
-            "byOffset": { "300": 1, "180": 1, "60": 1 } } }
-```
-Errors: `503` if `CRON_SECRET` isn't configured · `401` if the secret is missing/wrong.
-
-### `POST http://localhost:8000/api/v1/admin/reminders/dispatch`  · admin manual dispatch
-Admin-guarded. Same dispatch, on demand (useful for testing or backfilling a missed window). Optional body `{ "at": "<ISO date-time>" }` overrides "now" (admin-only). `200` → same payload as above.
-
-### `GET http://localhost:8000/api/v1/admin/reminders/upcoming?withinHours=24`  · admin visibility
-Admin-guarded. Upcoming confirmed shifts (default next 24 h, max 168) with each shift's per-offset reminder status.
-```json
-{ "success": true, "data": { "upcoming": [
-    { "responseId": "…",
-      "user": { "id": "…", "name": "Anna Müller", "email": "…" },
-      "shift": { "id": "…", "jobTitle": "Evening Waiter", "category": "Service", "startTime": "…" },
-      "reminders": [
-        { "offsetMinutes": 300, "hoursBefore": 5, "sent": true,  "sentAt": "…" },
-        { "offsetMinutes": 180, "hoursBefore": 3, "sent": false, "sentAt": null },
-        { "offsetMinutes": 60,  "hoursBefore": 1, "sent": false, "sentAt": null }
-      ] } ] } }
-```
-
-> **Staff side:** there is no separate staff endpoint — reminders arrive as notifications. In `GET /notifications` (§15) they appear with `type: "SHIFT_REMINDER"`, a body like *"Your shift \"Evening Waiter\" (Service) starts in 5 hours."*, and `payload: { shiftOfferId, offsetMinutes, hoursBefore, startTime }`.
-
----
-
-## 22. Enum Reference
+## 18. Enum Reference
 
 | Enum | Values |
 |------|--------|
@@ -1147,14 +964,13 @@ Admin-guarded. Upcoming confirmed shifts (default next 24 h, max 168) with each 
 | `ShiftSwapStatus` | `PENDING`, `APPROVED`, `REJECTED`, `CANCELLED` |
 | `PlanStatus` (workload week) | `DRAFT`, `SUBMITTED`, `PUBLISHED` |
 | `DemandWeekStatus` (demands week) | `DRAFT`, `PUBLISHED` |
-| `SchedulePublicationStatus` (month publish gate) | `DRAFT`, `PUBLISHED` |
-| `NotificationType` | `SHIFT_OFFER_PUBLISHED`, `SHIFT_REMINDER`, `SHIFT_CHANGED`, `SWAP_REQUEST_RECEIVED`, `SWAP_REQUEST_RESULT`, `WEEKLY_SHIFTS_PUBLISHED`, `AVAILABILITY_REMINDER`, `RULE_VIOLATION`, `GENERAL` |
+| `NotificationType` | `SHIFT_OFFER_PUBLISHED`, `SHIFT_CHANGED`, `SWAP_REQUEST_RECEIVED`, `SWAP_REQUEST_RESULT`, `WEEKLY_SHIFTS_PUBLISHED`, `AVAILABILITY_REMINDER`, `RULE_VIOLATION`, `GENERAL` |
 | `NotificationChannel` | `PUSH`, `EMAIL`, `IN_APP` |
 | `NotificationStatus` | `PENDING`, `SENT`, `FAILED`, `READ` |
 
 ---
 
-## 23. Seed Script
+## 19. Seed Script
 
 Create the default admin (idempotent):
 ```bash
@@ -1283,14 +1099,10 @@ The admin then **approves/rejects** on `/api/v1/admin/swaps` (§8). On **approve
 | Admin — Reports | 2 |
 | Admin — Settings | 2 |
 | Admin — Availability | 5 |
-| Admin — Schedule Publishing | 4 |
 | Staff — Shifts | 3 |
 | Staff — Notifications | 3 |
 | Staff — Shift Swaps | 3 |
 | Staff — Availability | 4 |
-| Staff — My Schedule | 2 |
-| Staff — My Hours | 1 |
-| Shift Reminders (cron + admin) | 3 |
-| **Total** | **89** |
+| **Total** | **79** |
 
 > **Not yet implemented (deferred scheduling engine):** the weekly-plan **auto-generation** ("Manage Plans") — automatically turning demand + submitted availability into a rule-compliant proposed roster, with hand-adjustment and per-change L-GAV feedback. The demand side is now built two ways — the day-level **Demands** grid (§10, `DemandWeek` / `DayDemand`) and the shift-slot **Workload** layer (§9, `WeeklyPlan` / `StaffingDemand`) — and employee **availability collection** too (§13 & §17); what remains is only the constraint-solving/roster-generation engine that consumes them. Also open (not blocking): "open to the whole team" swaps (current swaps are targeted) and actual clock-in/out worked-hours capture (reports currently derive hours from approved shifts). Tracked in `implimated.md`.

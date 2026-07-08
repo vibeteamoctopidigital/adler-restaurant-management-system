@@ -27,7 +27,7 @@ function SwapSkeleton() {
 
 export function PendingSwapsCard({ loading, swaps }: PendingSwapsCardProps) {
   return (
-    <Card className="rounded-2xl border-slate-200 shadow-sm bg-white overflow-hidden">
+    <Card className="rounded-2xl lg:col-span-1 border-slate-200 shadow-sm bg-white overflow-hidden">
       <CardHeader className="flex-row items-center justify-between bg-slate-50/50 border-b border-slate-100 pb-4">
         <CardTitle className="text-lg font-bold text-slate-900">Pending Swaps</CardTitle>
         <Button variant="ghost" size="sm" asChild className="text-primary hover:text-primary hover:bg-primary/5">

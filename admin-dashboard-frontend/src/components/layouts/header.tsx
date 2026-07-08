@@ -1,15 +1,16 @@
-import { Bell, Search, AlignJustify, UtensilsCrossed } from 'lucide-react';
+import { Bell, AlignJustify, UtensilsCrossed, Sparkles } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
 
 import { useSidebar } from '@/components/ui/sidebar';
-import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { UserDropdown } from './user-dropdown';
 
 export function Header() {
   const { toggleSidebar } = useSidebar();
+  const navigate = useNavigate();
 
   return (
-    <header className="h-16 flex items-center gap-3 border-b border-black/[0.06] bg-white/80 backdrop-blur-xl shadow-sm px-3 md:px-5 sticky top-0 z-30">
+    <header className="h-[65px] flex items-center gap-4 border-b border-slate-200/60 bg-white/70 backdrop-blur-2xl shadow-sm px-4 md:px-6 top-0 z-30 sticky">
       {/* Left: Hamburger + Logo on mobile */}
       <div className="flex items-center gap-3">
         <button
@@ -22,32 +23,29 @@ export function Header() {
 
         {/* Mobile logo */}
         <div className="flex items-center gap-2 md:hidden">
-          <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-blue-600 to-blue-500 text-white shadow-sm">
+          <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-blue-600 to-indigo-600 text-white shadow-md shadow-blue-500/20">
             <UtensilsCrossed className="h-4 w-4" />
           </div>
-          <span className="text-sm font-bold text-[#1E293B]">ADLER</span>
+          <span className="text-[17px] font-black tracking-tight text-slate-900 flex items-center gap-1.5">
+            ADLER
+            <Sparkles className="h-3.5 w-3.5 text-blue-500" />
+          </span>
         </div>
       </div>
 
-      {/* Search
-      <div className="relative hidden md:block max-w-sm flex-1">
-        <Search className="absolute left-3 top-3 h-4 w-4 text-[#A09F9A]" />
-        <Input
-          placeholder="Search employees, shifts…"
-          className="pl-9 h-12 bg-black/[0.03] border-black/[0.08] focus-visible:ring-blue-500/20 focus-visible:border-blue-400/50 rounded-xl text-sm transition-all"
-        /> */}
-      {/* </div> */}
+    
 
       {/* Right actions */}
       <div className="ml-auto flex items-center gap-1">
         <Button
           variant="ghost"
           size="icon"
-          className="relative h-12 w-12 text-[#64748B] hover:text-[#1E293B] hover:bg-black/[0.04] rounded-xl transition-all"
+          onClick={() => navigate('/dashboard/notifications')}
+          className="relative h-11 w-11 text-slate-500 hover:text-slate-900 hover:bg-slate-100 rounded-full transition-all"
           aria-label="Notifications"
         >
-          <Bell className="h-6 w-6" />
-          <span className="absolute top-2 right-2 h-3 w-3 rounded-full bg-blue-500 ring-2 ring-white animate-pulse" />
+          <Bell className="h-[22px] w-[22px]" />
+          <span className="absolute top-[10px] right-[10px] h-2.5 w-2.5 rounded-full bg-blue-600 ring-2 ring-white" />
         </Button>
 
         <UserDropdown />

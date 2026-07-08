@@ -34,7 +34,6 @@ export {
   employeeService,
   employeeSchema,
   EMPLOYMENT_TYPES,
-  EMPLOYEE_STATUSES,
   type Employee,
   type EmployeeInput,
   type EmployeeFilters,

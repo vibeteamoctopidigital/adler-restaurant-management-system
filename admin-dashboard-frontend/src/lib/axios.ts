@@ -1,4 +1,4 @@
-import axios, { type AxiosError, type InternalAxiosRequestConfig } from 'axios';
+import axios, { type AxiosError } from 'axios';
 
 /** Standard error thrown for all failed API calls. */
 export class ApiError extends Error {

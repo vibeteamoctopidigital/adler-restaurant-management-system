@@ -6,8 +6,6 @@
 import type { Employee } from "@/features/employees/api/employee.service";
 import { EmployeeTable } from "./employee-table-component";
 
-
-
 interface EmployeeTableContainerProps {
   employees: Employee[];
   isLoading: boolean;
@@ -18,6 +16,10 @@ interface EmployeeTableContainerProps {
   onToggleStatus: (emp: Employee) => void;
   onDelete: (emp: Employee) => void;
   onAdd: () => void;
+  page: number;
+  hasNextPage: boolean;
+  onNextPage: () => void;
+  onPrevPage: () => void;
 }
 
 export function EmployeeTableContainer({
@@ -30,6 +32,10 @@ export function EmployeeTableContainer({
   onToggleStatus,
   onDelete,
   onAdd,
+  page,
+  hasNextPage,
+  onNextPage,
+  onPrevPage,
 }: EmployeeTableContainerProps) {
   return (
     <EmployeeTable
@@ -42,6 +48,10 @@ export function EmployeeTableContainer({
       onToggleStatus={onToggleStatus}
       onDelete={onDelete}
       onAdd={onAdd}
+      page={page}
+      hasNextPage={hasNextPage}
+      onNextPage={onNextPage}
+      onPrevPage={onPrevPage}
     />
   );
 }

@@ -46,8 +46,6 @@ model ShiftOfferResponse {
   approvedAt     DateTime?
   approvalNote   String?
 
-  reminders ShiftReminder[]
-
   @@unique([shiftOfferId, userId])
   @@index([userId])
   @@index([shiftOfferId])

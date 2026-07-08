@@ -2,7 +2,6 @@ import type { Request, Response, NextFunction } from "express";
 import { jwtUtils } from "../utils/jwt";
 import { envConfig } from "../config/env";
 import { sendError } from "../utils/apiResponse";
-import { logger } from "../utils/logger";
 
 /**
  * Authenticate — verifies the accessToken cookie.
@@ -51,13 +50,13 @@ export const authenticate = (req: Request, res: Response, next: NextFunction): v
  */
 export const authorizeAdmin = (_req: Request, res: Response, next: NextFunction): void => {
  
-  // if (!res.locals.auth || res.locals.auth.role !== "ADMIN") {
-  //   sendError(res, {
-  //     statusCode: 403,
-  //     message: "Access denied. Admin privileges required.",
-  //   });
-  //   return;
-  // }
+  if (!res.locals.auth || res.locals.auth.role !== "ADMIN") {
+    sendError(res, {
+      statusCode: 403,
+      message: "Access denied. Admin privileges required.",
+    });
+    return;
+  }
 
   next();
 };
@@ -67,13 +66,13 @@ export const authorizeAdmin = (_req: Request, res: Response, next: NextFunction)
  * Rejects with 403 if the authenticated principal is not a staff user.
  */
 export const authorizeUser = (_req: Request, res: Response, next: NextFunction): void => {
-  // if (!res.locals.auth || res.locals.auth.role !== "USER") {
-  //   sendError(res, {
-  //     statusCode: 403,
-  //     message: "Access denied. Staff account required.",
-  //   });
-  //   return;
-  // }
+  if (!res.locals.auth || res.locals.auth.role !== "USER") {
+    sendError(res, {
+      statusCode: 403,
+      message: "Access denied. Staff account required.",
+    });
+    return;
+  }
 
   next();
 };

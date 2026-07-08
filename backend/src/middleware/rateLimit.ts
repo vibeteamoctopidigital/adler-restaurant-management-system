@@ -5,8 +5,21 @@ import { sendError } from "../utils/apiResponse";
 
 const windowMs = envConfig.RATE_LIMIT_WINDOW_MS;
 
-const tooMany = (res: Response, message: string) =>
-  sendError(res, { statusCode: 429, message });
+// Returns a 429 with a `Retry-After` header (seconds until the window resets) so
+// clients know exactly how long to back off. A custom `handler` otherwise loses
+// the library's built-in Retry-After, so we set it explicitly.
+const limitHandler =
+  (message: string) =>
+  (req: Request, res: Response): void => {
+    // express-rate-limit attaches `rateLimit` to the request at runtime.
+    const reset = (req as Request & { rateLimit?: { resetTime?: Date } }).rateLimit
+      ?.resetTime;
+    if (reset) {
+      const retryAfter = Math.max(0, Math.ceil((reset.getTime() - Date.now()) / 1000));
+      res.setHeader("Retry-After", String(retryAfter));
+    }
+    sendError(res, { statusCode: 429, message });
+  };
 
 // ─── Global limiter ──────────────────────────────────────────────
 // A generous per-IP ceiling that blunts scraping / abuse without getting in
@@ -17,8 +30,7 @@ export const apiLimiter = rateLimit({
   standardHeaders: true, // emit RateLimit-* headers
   legacyHeaders: false, // drop the deprecated X-RateLimit-* headers
   skip: (req: Request) => req.path === "/health",
-  handler: (_req, res) =>
-    tooMany(res, "Too many requests. Please slow down and try again shortly."),
+  handler: limitHandler("Too many requests. Please slow down and try again shortly."),
 });
 
 // ─── Auth limiter ────────────────────────────────────────────────
@@ -32,6 +44,5 @@ export const authLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   skipSuccessfulRequests: true,
-  handler: (_req, res) =>
-    tooMany(res, "Too many attempts. Please wait a few minutes and try again."),
+  handler: limitHandler("Too many attempts. Please wait a few minutes and try again."),
 });

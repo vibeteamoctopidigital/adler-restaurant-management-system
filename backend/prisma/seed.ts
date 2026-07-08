@@ -5,7 +5,6 @@ import bcrypt from 'bcrypt';
 const prisma = new PrismaClient();
 
 async function main() {
-  console.log('Starting seed...');
 
   // Clean up existing data to avoid conflicts
 await prisma.$transaction(async (tx) => {
@@ -24,7 +23,6 @@ await prisma.$transaction(async (tx) => {
 });
 
   // 1. Create Categories
-  console.log('Creating categories...');
   const categoryNames = ['Service', 'Kitchen', 'Bar', 'Management'];
   const categories = await Promise.all(
     categoryNames.map((name) =>
@@ -38,7 +36,6 @@ await prisma.$transaction(async (tx) => {
   const kitchenCategory = categories.find((c) => c.name === 'Kitchen')!;
 
   // 2. Create Users
-  console.log('Creating users...');
   const passwordHash = await bcrypt.hash('password123', 10);
   
 const usersData = [
@@ -158,7 +155,6 @@ const usersData = [
   );
 
   // 3. Create Availability for current month
-  console.log('Creating availability for this month...');
   const now = new Date();
   const year = now.getFullYear();
   const month = now.getMonth() + 1; // 1-12
@@ -206,7 +202,6 @@ const usersData = [
   }
 
   // 4. Create Demand for the current week
-  console.log('Creating demand for this week...');
   // Find Monday of the current week
   const today = new Date();
   const currentDay = today.getUTCDay();
@@ -251,7 +246,6 @@ const usersData = [
     data: dayDemands,
   });
 
-  console.log('Seed completed successfully!');
 }
 
 // const main = async () => {

@@ -50,7 +50,6 @@ export const authenticate = (req: Request, res: Response, next: NextFunction): v
  * Rejects with 403 if the authenticated user is not an admin.
  */
 export const authorizeAdmin = (_req: Request, res: Response, next: NextFunction): void => {
- console.log(res.locals.auth);
  
   // if (!res.locals.auth || res.locals.auth.role !== "ADMIN") {
   //   sendError(res, {

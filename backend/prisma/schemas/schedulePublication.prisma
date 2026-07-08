@@ -17,6 +17,6 @@ model SchedulePublication {
   updatedAt DateTime @updatedAt
 
   @@unique([year, month])
-  @@index([status])
+ 
   @@map("schedule_publications")
 }
